@@ -28,8 +28,7 @@ All utilities are now available through their respective hierarchical packages.
 # from .config import *
 # from .logging import *
 
-# Individual module imports for explicit access
-from . import config, core, infrastructure, logging, reporting, system, telemetry, testing
+from importlib import import_module
 
 # Export all available utilities
 __all__ = [
@@ -43,3 +42,11 @@ __all__ = [
     "logging",
     "telemetry",
 ]
+
+
+def __getattr__(name: str):
+    if name not in __all__:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = import_module(f".{name}", __name__)
+    globals()[name] = module
+    return module

@@ -1,0 +1,15 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+kpi:
+  proe_qualification_pass:
+    name: "PROe qualification pass"
+    type: "numeric"
+    validation:
+      operator: "eq"
+      reference: 1
+      enabled: true
+    unit: null
+    severity: "critical"
+    description: "All PROe execution and evidence checks passed (1=pass, 0=fail)"
+    default_value: 0

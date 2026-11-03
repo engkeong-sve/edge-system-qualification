@@ -7,6 +7,7 @@ Comprehensive guides for using and developing with Intel® ESQ.
 - **[Developer Guide](developer/index.md)** - Complete guide for integrating pytest tests into the Intel® ESQ framework
 - **[Optimization Guide](optimization.md)** - Performance optimization techniques
 - **[Troubleshooting Guide](troubleshooting.md)** - Common issues and solutions
+- **[PROe Integration](proe-esq-integration.md)** - Opt-in single-host PROe qualification
 
 ## Developer Guide Sections
 
