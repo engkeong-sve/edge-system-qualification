@@ -1,0 +1,46 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+name: "profile.suite.realtime.proe-single-host-tcc"
+description: "Opt-in PROe single-host qualification with TCC enabled"
+version: "1.0.0"
+params:
+  labels:
+    profile_display_name: "PROe Single Host (TCC)"
+    group: "realtime.proe"
+    type: "suite"
+    tags:
+      - "opt-in"
+      - "proe"
+  requirements:
+    os_type:
+      - "linux"
+suites:
+  - name: "realtime"
+    sub_suites:
+      - name: "proe"
+        tests:
+          test_proe_single_host:
+            params:
+              - test_id: "PROE-SH-TCC"
+                display_name: "PROe Single Host (TCC Enabled)"
+                description: |
+                  Runs the operator-selected PROe profile on one Canonical Ubuntu 24.04 host
+                  with two distinct IGC interfaces. Configure an absolute profile path and
+                  explicit numeric qualification thresholds before running.
+                proe_enabled: true
+                proe_executable: "proe"
+                profile_file: null
+                expected_tcc_enabled: true
+                process_timeout_s: null
+                kpi_refs:
+                  - proe_qualification_pass
+                thresholds:
+                  max_rtt_us: null
+                  max_processing_time_us: null
+                  max_rx_workload_us: null
+                  max_clock_offset_ns: null
+                  max_rtt_outliers: null
+                  max_processing_time_outliers: null
+                  max_rx_workload_outliers: null
+                  minimum_packets_per_role: null

@@ -26,7 +26,7 @@ import shutil
 from sysagent.utils.config import get_thirdparty_dir
 from sysagent.utils.core import shared_state
 from sysagent.utils.core.process import run_command
-from sysagent.utils.infrastructure import get_node_binary_paths
+from sysagent.utils.infrastructure.node import get_node_binary_paths
 
 logger = logging.getLogger(__name__)
 

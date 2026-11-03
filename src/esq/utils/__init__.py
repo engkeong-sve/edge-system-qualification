@@ -13,8 +13,7 @@ This package contains AI and model-specific utilities that extend the core sysag
 - telemetry: ESQ-specific telemetry modules (e.g., package_power via Intel RAPL)
 """
 
-# Import ESQ-specific packages
-from . import downloads, models, references, servers, telemetry
+from importlib import import_module
 
 __all__ = [
     # Modules
@@ -25,3 +24,11 @@ __all__ = [
     "references",
     "telemetry",
 ]
+
+
+def __getattr__(name: str):
+    if name not in __all__:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = import_module(f".{name}", __name__)
+    globals()[name] = module
+    return module
