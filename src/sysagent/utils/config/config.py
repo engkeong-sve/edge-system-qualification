@@ -78,6 +78,11 @@ def list_profiles(include_examples: bool = False) -> Dict[str, List[Dict[str, An
 
                 try:
                     config = load_yaml_config(file_path)
+                    from sysagent.utils.config.profile_availability import is_profile_available
+
+                    if not is_profile_available(config.get("name", item.split(".")[0]), config):
+                        logger.debug(f"Skipping profile with unavailable backend: {file_path}")
+                        continue
                     profile_items.append(
                         {
                             "configs": config,

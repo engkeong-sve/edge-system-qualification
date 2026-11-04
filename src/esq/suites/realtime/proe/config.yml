@@ -1,0 +1,7 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+# The PROe real-time profiles ship without KPI thresholds. A PROe run reports measured values;
+# ESQ applies a threshold only when one has been approved and added here.
+
+kpi: {}

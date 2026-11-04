@@ -248,5 +248,50 @@ For available profiles, use: {cli_name} list
         help="Disable masking of data (IP addresses, MAC addresses, serial numbers)",
     )
 
+    # Optional native backends are installed from a manually downloaded package (no automatic download)
+    install_parser = subparsers_action.add_parser(
+        "install",
+        help="Install an optional ESQ backend from a local package",
+        description=(
+            "Install an optional ESQ backend from a package that you downloaded manually. "
+            "The package is verified against the trusted SHA-256 before anything is executed."
+        ),
+    )
+    install_targets = install_parser.add_subparsers(dest="install_target", metavar="TARGET", required=True)
+    proe_parser = install_targets.add_parser(
+        "proe",
+        help="Install the PROe real-time benchmark backend",
+        description=(
+            "Install the PROe real-time benchmark backend from a local PROe binary package (ZIP). "
+            "The command validates the package, shows a preview of the system changes and asks for consent "
+            "before running the vendor installer with administrator privileges."
+        ),
+    )
+    proe_parser.add_argument("--package", required=True, metavar="PATH", help="Path to the downloaded PROe ZIP package")
+    proe_parser.add_argument(
+        "--sha256",
+        required=True,
+        metavar="CHECKSUM",
+        help="Trusted SHA-256 of the package, obtained from the package provider (not from the package itself)",
+    )
+    proe_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate the package and show the installation preview without changing the system",
+    )
+    proe_parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Consent to the previewed installation without an interactive prompt (reboot needs --allow-reboot)",
+    )
+    proe_parser.add_argument(
+        "--allow-reboot",
+        action="store_true",
+        help="Consent to an automatic reboot if the package declares that one is required",
+    )
+    proe_parser.add_argument("--verbose", "-v", action="store_true", help="Display more detailed output")
+    proe_parser.add_argument("--debug", "-d", action="store_true", help="Display debug output")
+
     # Return the modified parser (all other commands inherited from sysagent)
     return parser

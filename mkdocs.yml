@@ -138,6 +138,7 @@ nav:
     - Quick Start: getting-started/quick-start.md
     - Test Suites:
       - getting-started/suites/index.md
+      - PROe: getting-started/suites/proe.md
     - Telemetry:
       - getting-started/telemetry/index.md
 

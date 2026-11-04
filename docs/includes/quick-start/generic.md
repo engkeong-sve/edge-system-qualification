@@ -43,3 +43,7 @@ By default, this command:
 ### 2. Uninstall
 
 @import "../common/quick-start/uninstall.md"
+
+## Optional Components
+
+@import "../common/quick-start/proe.md"

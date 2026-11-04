@@ -23,6 +23,10 @@ def get_command_function(command_name: str):
         from .run import run_tests
 
         return run_tests
+    elif command_name == "install_package":
+        from .install import install_package
+
+        return install_package
     else:
         # Command not overridden by ESQ, fall back to sysagent
         return None
