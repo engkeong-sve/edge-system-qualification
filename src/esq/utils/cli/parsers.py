@@ -264,7 +264,10 @@ For available profiles, use: {cli_name} list
         description=(
             "Install the PROe real-time benchmark backend from a local PROe binary package (ZIP). "
             "The command validates the package, shows a preview of the system changes and asks for consent "
-            "before running the vendor installer with administrator privileges."
+            "before running the vendor installer with administrator privileges. PROe benchmarks need a real-time "
+            "kernel and boot parameters: when the host does not have them, the installation also installs them and "
+            "reboots the machine once at the end, after its sanity checks passed. Run the command once: it sets up "
+            "everything PROe needs."
         ),
     )
     proe_parser.add_argument("--package", required=True, metavar="PATH", help="Path to the downloaded PROe ZIP package")
@@ -275,23 +278,66 @@ For available profiles, use: {cli_name} list
         help="Trusted SHA-256 of the package, obtained from the package provider (not from the package itself)",
     )
     proe_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Validate the package and show the installation preview without changing the system",
-    )
-    proe_parser.add_argument(
         "--yes",
         "-y",
         action="store_true",
-        help="Consent to the previewed installation without an interactive prompt (reboot needs --allow-reboot)",
+        help=(
+            "Consent to the previewed installation without an interactive prompt (includes host preparation and "
+            "its reboot; a package-declared reboot needs --allow-reboot)"
+        ),
     )
     proe_parser.add_argument(
         "--allow-reboot",
         action="store_true",
         help="Consent to an automatic reboot if the package declares that one is required",
     )
-    proe_parser.add_argument("--verbose", "-v", action="store_true", help="Display more detailed output")
+    proe_parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Show the raw output of apt, the build and the installer instead of one progress line per step",
+    )
     proe_parser.add_argument("--debug", "-d", action="store_true", help="Display debug output")
+
+    # Undo an optional backend installation and the host changes that its installation made
+    uninstall_parser = subparsers_action.add_parser(
+        "uninstall",
+        help="Uninstall an optional ESQ backend and undo the host changes of its installation",
+        description=(
+            "Uninstall an optional ESQ backend that was installed with 'esq install'. The command removes what the "
+            "installation added to the system, using the record that the installation kept, and shows a preview "
+            "before it asks for consent."
+        ),
+    )
+    uninstall_targets = uninstall_parser.add_subparsers(dest="uninstall_target", metavar="TARGET", required=True)
+    proe_uninstall_parser = uninstall_targets.add_parser(
+        "proe",
+        help="Uninstall the PROe real-time benchmark backend",
+        description=(
+            "Remove PROe and undo the host changes made by 'esq install proe': the host tools that ESQ installed, "
+            "libyang, the PROe GRUB boot parameters and the real-time kernel. Your original GRUB files are backed up "
+            "by the installation and kept. A running real-time kernel is removed after a reboot: run the same "
+            "command again afterwards."
+        ),
+    )
+    proe_uninstall_parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Consent to the previewed removal without an interactive prompt (includes the reboot it may need)",
+    )
+    proe_uninstall_parser.add_argument(
+        "--keep-data",
+        action="store_true",
+        help="Keep the PROe configuration (/etc/proe) and the logs and benchmark results (/var/log/proe)",
+    )
+    proe_uninstall_parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Show the raw output of apt and the removal commands instead of one progress line per step",
+    )
+    proe_uninstall_parser.add_argument("--debug", "-d", action="store_true", help="Display debug output")
 
     # Return the modified parser (all other commands inherited from sysagent)
     return parser

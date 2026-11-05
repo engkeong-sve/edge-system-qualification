@@ -14,6 +14,11 @@ SUPPORTED_OS_ID = "ubuntu"
 SUPPORTED_OS_VERSIONS: Tuple[str, ...] = ("24.04", "26.04")
 SUPPORTED_ARCH = "x86_64"
 
+# Real-time benchmarks need a PREEMPT_RT kernel. Ubuntu ships it as this apt metapackage (no Ubuntu Pro needed).
+RT_KERNEL_PACKAGE = "ubuntu-realtime"
+# Present and "1" only while a PREEMPT_RT kernel is running.
+RT_KERNEL_SYSFS = "/sys/kernel/realtime"
+
 # Files that a package must contain. Paths are relative to the single package root directory.
 PROVENANCE_FILE = "PROVENANCE.json"
 CAPABILITIES_FILE = "esq-capabilities.json"

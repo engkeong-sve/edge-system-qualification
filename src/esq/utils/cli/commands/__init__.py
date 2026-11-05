@@ -27,6 +27,10 @@ def get_command_function(command_name: str):
         from .install import install_package
 
         return install_package
+    elif command_name == "uninstall_package":
+        from .uninstall import uninstall_package
+
+        return uninstall_package
     else:
         # Command not overridden by ESQ, fall back to sysagent
         return None

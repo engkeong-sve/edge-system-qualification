@@ -86,7 +86,7 @@ def _main() -> int:
 
     # Skip dependency verification for deps command or commands that don't need it
     # The installer verifies its own prerequisites and must work before benchmark dependencies exist
-    skip_deps = args.command in ("deps", "install") or not hasattr(args, "command")
+    skip_deps = args.command in ("deps", "install", "uninstall") or not hasattr(args, "command")
 
     # GitHub repo downloads (e.g. allure3) are only needed to generate reports. "run" downloads
     # inside run_tests, right after the network readiness check, so only "report" needs it here;
@@ -171,9 +171,17 @@ def _main() -> int:
                 target=args.install_target,
                 package=args.package,
                 sha256=args.sha256,
-                dry_run=args.dry_run,
                 assume_yes=args.yes,
                 allow_reboot=args.allow_reboot,
+                verbose=verbose or debug,
+            )
+        elif args.command == "uninstall":
+            uninstall_package = get_command_function("uninstall_package")
+            return uninstall_package(
+                target=args.uninstall_target,
+                assume_yes=args.yes,
+                keep_data=args.keep_data,
+                verbose=verbose or debug,
             )
         elif args.command == "deps":
             if args.list:

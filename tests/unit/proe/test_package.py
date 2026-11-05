@@ -185,7 +185,7 @@ class PackageValidationTests(unittest.TestCase):
         with self.assertRaises(PackageError):
             self._inspect(zip_path, sha)
 
-    def test_dry_run_inspection_writes_nothing(self):
+    def test_inspection_writes_nothing(self):
         zip_path, sha = syn.build_package(self.dir)
         before = set(self.dir.iterdir())
         self._inspect(zip_path, sha)

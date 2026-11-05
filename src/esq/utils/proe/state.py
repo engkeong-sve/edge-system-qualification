@@ -33,10 +33,17 @@ from esq.utils.proe.constants import (
 )
 
 STATE_AWAITING_REBOOT = "awaiting-reboot"
+STATE_UNINSTALL_REBOOT = "uninstall-awaiting-reboot"
 STATE_INSTALLING = "installing"
 STATE_INSTALLED = "installed"
 STATE_FAILED = "failed"
-_VALID_STATES = {STATE_AWAITING_REBOOT, STATE_INSTALLING, STATE_INSTALLED, STATE_FAILED}
+_VALID_STATES = {
+    STATE_AWAITING_REBOOT,
+    STATE_UNINSTALL_REBOOT,
+    STATE_INSTALLING,
+    STATE_INSTALLED,
+    STATE_FAILED,
+}
 
 
 def is_absolute_path(path: str) -> bool:

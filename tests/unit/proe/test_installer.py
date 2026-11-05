@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from esq.utils.proe import host_changes, host_prep
 from esq.utils.proe import installer as inst
 from esq.utils.proe import state as proe_state
 from esq.utils.proe.availability import explain, is_available
@@ -14,29 +15,73 @@ from esq.utils.proe.package import HostInfo
 from . import synthetic as syn
 
 SUPPORTED_PROFILE = "profile.suite.realtime.proe_1ms_ai"
+FULL_CMDLINE = "BOOT_IMAGE=/vmlinuz ro quiet splash " + " ".join(host_prep.BOOT_PARAMS)
+STOCK_CMDLINE = "BOOT_IMAGE=/vmlinuz ro quiet splash vt.handoff=7"
 
 
 class FakeRunner:
     """Pretends to be the vendor installer by copying the runtime trees to a fake install root."""
 
-    def __init__(self, installed_root: Path, *, install_code=0, version_code=0, service="active"):
+    def __init__(
+        self,
+        installed_root: Path,
+        *,
+        install_code=0,
+        version_code=0,
+        service="active",
+        cpupower_code=0,
+        candidate="6.8.1-1015.16",
+        installer_code=0,
+    ):
         self.installed_root = installed_root
         self.install_code = install_code
         self.version_code = version_code
         self.service = service
+        self.cpupower_code = cpupower_code
+        self.candidate = candidate
+        self.installer_code = installer_code
+        self.packages = {"bash"}
+        self.hook = None
         self.streamed = []
         self.captured = []
 
     def stream(self, argv, log_path, cwd):
         self.streamed.append((list(argv), Path(cwd)))
-        Path(log_path).write_text("vendor log\n")
-        if self.install_code == 0:
+        with open(log_path, "a") as log:
+            log.write("vendor log\n")
+        if self.hook is not None:
+            self.hook(list(argv))
+        if self.install_code == 0 and "apt-get" in argv and "install" in argv:
+            self.packages.update(a for a in argv[argv.index("install") + 1 :] if not a.startswith("-"))
+            if "ubuntu-realtime" in argv:
+                self.packages.add("linux-image-6.8.1-1015-realtime")
+        if self.install_code == 0 and argv[:3] == ["cmake", "--install", "libyang/build"]:
+            manifest = Path(cwd) / "libyang" / "build" / "install_manifest.txt"
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            manifest.write_text("/usr/local/lib/libyang.so\n/usr/local/bin/yanglint\n")
+        if self.install_code == 0 and argv[:2] == ["install", "-d"]:
+            for target in argv[4:]:
+                Path(target).mkdir(parents=True, exist_ok=True)
+        if self.install_code == 0 and argv[:2] == ["install", "-D"]:
+            Path(argv[-1]).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(argv[-2], argv[-1])
+        if argv[-1].endswith("install.sh") and self.installer_code != 0:
+            return self.installer_code
+        if self.install_code == 0 and argv[-1].endswith("install.sh"):
             for tree in ("cli.dist", "daemon.dist"):
                 shutil.copytree(Path(cwd) / tree, self.installed_root / tree)
         return self.install_code
 
     def capture(self, argv, timeout):
         self.captured.append(list(argv))
+        if argv[0] == "dpkg-query":
+            return 0, "".join(f"ii \t{name}\n" for name in sorted(self.packages))
+        if argv[0] == "cpupower":
+            return self.cpupower_code, "cpupower 7.0\n"
+        if argv[0] == "apt-cache":
+            if self.candidate is None:
+                return 100, ""
+            return 0, f"linux-image-realtime:\n  Installed: (none)\n  Candidate: {self.candidate}\n  Version table:\n"
         if argv[-1] == "--version":
             return self.version_code, "proe 1.0.0\n"
         if argv[:2] == ["systemctl", "is-active"]:
@@ -56,6 +101,18 @@ class InstallerTests(unittest.TestCase):
         self.conf = conf
         self.out = []
         self.boot = "boot-1"
+        self.rt = True
+        self.release = "6.8.1-1015-realtime"
+        self.cmdline = FULL_CMDLINE
+        self.missing_tools = set()
+        self.grub = self.root / "grub"
+        (self.grub / "grub.d").mkdir(parents=True)
+        self.grub_default = self.grub / "default"
+        self.grub_default.write_text(
+            'GRUB_DEFAULT=0\nGRUB_CMDLINE_LINUX_DEFAULT="quiet splash"\nGRUB_CMDLINE_LINUX=""\n'
+        )
+        self.dropin = self.grub / "grub.d" / host_prep.DROPIN_NAME
+        self.backup = self.grub / "backup"
 
     def _env(self, runner=None, *, interactive=True, answers=(), existing=None, is_root=True, host=None):
         answers = list(answers)
@@ -68,6 +125,14 @@ class InstallerTests(unittest.TestCase):
             prompt=lambda _q: answers.pop(0) if answers else "n",
             out=self.out.append,
             boot_id=lambda: self.boot,
+            rt_kernel_active=lambda: self.rt,
+            kernel_release=lambda: self.release,
+            read_cmdline=lambda: self.cmdline,
+            tool_available=lambda tool: tool not in self.missing_tools,
+            grub_default=self.grub_default,
+            grub_dropin_dir=self.grub / "grub.d",
+            grub_backup_dir=self.backup,
+            grub_cfg=self.grub / "grub.cfg",
             state_dir=self.state,
             existing_paths=existing or (lambda: [str(p) for p in (self.installed,) if p.exists()]),
             installed_root=self.installed,
@@ -90,11 +155,11 @@ class InstallerTests(unittest.TestCase):
         cli.write_text("#!/bin/sh\n")
         cli.chmod(0o755)
 
-    def test_dry_run_changes_nothing(self):
+    def test_the_preview_is_shown_before_consent_and_declining_changes_nothing(self):
         zip_path, sha = self._package(capabilities=syn.CAPABILITIES)
-        env = self._env()
-        code = inst.run_install(self._opts(zip_path, sha, dry_run=True), env)
-        self.assertEqual(code, inst.EXIT_OK)
+        env = self._env(answers=["n"])
+        code = inst.run_install(self._opts(zip_path, sha), env)
+        self.assertEqual(code, inst.EXIT_ACTION_REQUIRED)
         self.assertEqual(self.runner.streamed, [])
         self.assertFalse(self.state.exists())
         self.assertIn("PROe installation preview", self._text())
@@ -103,8 +168,8 @@ class InstallerTests(unittest.TestCase):
 
     def test_preview_states_when_no_profiles_are_supported(self):
         zip_path, sha = self._package()
-        code = inst.run_install(self._opts(zip_path, sha, dry_run=True), self._env())
-        self.assertEqual(code, inst.EXIT_OK)
+        code = inst.run_install(self._opts(zip_path, sha), self._env(answers=["n"]))
+        self.assertEqual(code, inst.EXIT_ACTION_REQUIRED)
         self.assertIn("NONE", self._text())
 
     def test_bad_checksum_runs_nothing(self):
@@ -238,7 +303,9 @@ class InstallerTests(unittest.TestCase):
         inst.run_install(self._opts(zip_path, sha, assume_yes=True), self._env(existing=lambda: []))
         other_dir = self.root / "other"
         other_dir.mkdir()
-        zip2, sha2 = syn.build_package(other_dir, capabilities=syn.CAPABILITIES, provenance_overrides={"createdUtc": "x"})
+        zip2, sha2 = syn.build_package(
+            other_dir, capabilities=syn.CAPABILITIES, provenance_overrides={"createdUtc": "x"}
+        )
         code = inst.run_install(self._opts(zip2, sha2, assume_yes=True), self._env())
         self.assertEqual(code, inst.EXIT_ERROR)
         self.assertEqual(self.runner.streamed, [])
@@ -251,14 +318,6 @@ class InstallerTests(unittest.TestCase):
         code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), self._env())
         self.assertEqual(code, inst.EXIT_ERROR)
         self.assertIn("did not complete", self._text())
-
-    def test_dry_run_with_existing_install_does_not_modify_state(self):
-        self._make_cli()
-        zip_path, sha = self._package(capabilities=syn.CAPABILITIES)
-        inst.run_install(self._opts(zip_path, sha, assume_yes=True), self._env(existing=lambda: []))
-        record_before = (self.state / "capability.json").read_text()
-        self.assertEqual(inst.run_install(self._opts(zip_path, sha, dry_run=True), self._env()), inst.EXIT_OK)
-        self.assertEqual((self.state / "capability.json").read_text(), record_before)
 
     def _reboot_caps(self):
         caps = dict(syn.CAPABILITIES, requires_reboot=True)
@@ -300,6 +359,470 @@ class InstallerTests(unittest.TestCase):
         env = self._env(interactive=False, existing=lambda: [])
         inst.run_install(self._opts(zip_path, sha, assume_yes=True, allow_reboot=True), env)
         self.assertTrue(any(c[:2] == ["systemctl", "reboot"] for c in self.runner.captured))
+
+    def _commands(self):
+        return [a for a, _ in self.runner.streamed]
+
+    def _rebooted(self):
+        return any(c[:2] == ["systemctl", "reboot"] for c in self.runner.captured)
+
+    def test_preview_states_that_host_is_not_prepared(self):
+        self.rt = False
+        self.cmdline = STOCK_CMDLINE
+        zip_path, sha = self._package()
+        code = inst.run_install(self._opts(zip_path, sha), self._env(answers=["n"]))
+        self.assertEqual(code, inst.EXIT_ACTION_REQUIRED)
+        text = self._text()
+        self.assertIn("NOT running", text)
+        self.assertIn("ubuntu-realtime", text)
+        self.assertIn("isolcpus=1,2", text)
+        self.assertIn(host_prep.DROPIN_NAME, text)
+        self.assertIn("REQUIRED", text)
+        self.assertEqual(self.runner.streamed, [])
+        self.assertFalse(self.dropin.exists())
+
+    def test_preview_shows_the_minimum_and_what_apt_offers(self):
+        self.rt = False
+        self.cmdline = STOCK_CMDLINE
+        zip_path, sha = self._package()
+        inst.run_install(self._opts(zip_path, sha), self._env(answers=["n"]))
+        self.assertIn("minimum 6.8.1", self._text())
+        self.assertIn("apt offers 6.8.1-1015.16", self._text())
+
+    def test_running_rt_kernel_older_than_the_minimum_is_prepared_again(self):
+        self.release = "6.6.0-1000-realtime"
+        zip_path, sha = self._package()
+        env = self._env(interactive=False, existing=lambda: [])
+        code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), env)
+        self.assertEqual(code, inst.EXIT_OK)
+        self.assertIn("TOO OLD (6.6.0-1000-realtime, minimum 6.8.1)", self._text())
+        self.assertTrue(any("ubuntu-realtime" in c for c in self._commands()))
+        self.assertTrue(self._rebooted())
+
+    def test_newer_rt_kernel_than_the_minimum_is_accepted(self):
+        self.release = "7.0.0-29-realtime"
+        zip_path, sha = self._package()
+        self._make_cli()
+        env = self._env(existing=lambda: [])
+        self.assertEqual(inst.run_install(self._opts(zip_path, sha, assume_yes=True), env), inst.EXIT_OK)
+        self.assertFalse(any("ubuntu-realtime" in c for c in self._commands()))
+
+    def test_apt_offering_an_older_kernel_stops_before_any_change(self):
+        self.rt = False
+        self.cmdline = STOCK_CMDLINE
+        zip_path, sha = self._package()
+        runner = FakeRunner(self.installed, candidate="6.6.0-1000.1")
+        env = self._env(runner=runner, existing=lambda: [])
+        code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), env)
+        self.assertEqual(code, inst.EXIT_ERROR)
+        self.assertIn("apt only offers 6.6.0-1000.1", self._text())
+        self.assertEqual(runner.streamed, [])
+        self.assertFalse(self.state.exists())
+        self.assertFalse(self._rebooted())
+
+    def test_unknown_apt_candidate_does_not_block_the_preparation(self):
+        self.rt = False
+        self.cmdline = STOCK_CMDLINE
+        zip_path, sha = self._package()
+        runner = FakeRunner(self.installed, candidate=None)
+        env = self._env(runner=runner, existing=lambda: [])
+        code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), env)
+        self.assertEqual(code, inst.EXIT_OK)
+        self.assertTrue(any("ubuntu-realtime" in c for c in self._commands()))
+
+    def test_rerun_after_a_reboot_into_an_old_rt_kernel_explains(self):
+        self.rt = False
+        self.cmdline = STOCK_CMDLINE
+        zip_path, sha = self._package()
+        inst.run_install(self._opts(zip_path, sha, assume_yes=True), self._env(existing=lambda: []))
+        self.boot = "boot-2"
+        self.rt = True
+        self.release = "6.6.0-1000-realtime"
+        self.cmdline = FULL_CMDLINE
+        env = self._env()
+        code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), env)
+        self.assertEqual(code, inst.EXIT_ACTION_REQUIRED)
+        self.assertIn("older than the required 6.8.1", self._text())
+        self.assertEqual(self.runner.streamed, [])
+
+    def test_host_preparation_is_recorded_for_uninstall(self):
+        self.rt = False
+        self.cmdline = STOCK_CMDLINE
+        zip_path, sha = self._package()
+        env = self._env(interactive=False, existing=lambda: [])
+        inst.run_install(self._opts(zip_path, sha, assume_yes=True), env)
+        record = host_changes.read_host_changes(self.state)
+        self.assertEqual(record.kernel_packages, ("linux-image-6.8.1-1015-realtime", "ubuntu-realtime"))
+        self.assertEqual(record.tool_packages, ())
+        self.assertEqual(record.grub_dropin, str(self.dropin))
+        self.assertEqual(record.grub_backup, str(self.backup))
+
+    def test_host_tools_and_libyang_are_recorded_for_uninstall(self):
+        self._make_cli()
+        self.missing_tools = {"tuna", "yanglint"}
+        zip_path, sha = self._package()
+        env = self._env(existing=lambda: [])
+        self.runner.hook = lambda argv: self.missing_tools.clear() if argv[0] == "ldconfig" else None
+        inst.run_install(self._opts(zip_path, sha, assume_yes=True), env)
+        record = host_changes.read_host_changes(self.state)
+        self.assertIn("tuna", record.tool_packages)
+        self.assertIn("cmake", record.tool_packages)
+        self.assertNotIn("bash", record.tool_packages)
+        self.assertEqual(record.libyang_manifest, host_changes.LIBYANG_MANIFEST_FILE)
+        self.assertEqual(
+            host_changes.libyang_files(self.state, record),
+            ["/usr/local/lib/libyang.so", "/usr/local/bin/yanglint"],
+        )
+
+    def test_packages_that_were_already_installed_are_not_recorded(self):
+        self._make_cli()
+        self.missing_tools = {"tuna"}
+        zip_path, sha = self._package()
+        runner = FakeRunner(self.installed)
+        runner.packages.add("tuna")
+        env = self._env(runner=runner, existing=lambda: [])
+        runner.hook = lambda argv: self.missing_tools.clear() if "install" in argv else None
+        inst.run_install(self._opts(zip_path, sha, assume_yes=True), env)
+        self.assertEqual(host_changes.read_host_changes(self.state).tool_packages, ())
+
+    def test_install_is_refused_while_an_uninstall_waits_for_a_reboot(self):
+        zip_path, sha = self._package()
+        proe_state.write_install_state(
+            proe_state.InstallState(proe_state.STATE_UNINSTALL_REBOOT, sha, "proe-binary-ubuntu24.04-x86_64-12538f28"),
+            self.state,
+        )
+        env = self._env(interactive=False, existing=lambda: [])
+        code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), env)
+        self.assertEqual(code, inst.EXIT_ERROR)
+        self.assertIn("esq uninstall proe", self._text())
+        self.assertEqual(self.runner.streamed, [])
+
+    def test_host_preparation_declined_changes_nothing(self):
+        self.rt = False
+        self.cmdline = STOCK_CMDLINE
+        zip_path, sha = self._package()
+        env = self._env(answers=["n"], existing=lambda: [])
+        code = inst.run_install(self._opts(zip_path, sha), env)
+        self.assertEqual(code, inst.EXIT_ACTION_REQUIRED)
+        self.assertEqual(self.runner.streamed, [])
+        self.assertFalse(self.state.exists())
+        self.assertFalse(self.dropin.exists())
+        self.assertIn("cancelled", self._text())
+
+    def test_one_confirmation_prepares_host_and_reboots(self):
+        self.rt = False
+        self.cmdline = STOCK_CMDLINE
+        zip_path, sha = self._package()
+        prompts = []
+        env = self._env(answers=["y"], existing=lambda: [])
+        original = env.prompt
+        env.prompt = lambda q: (prompts.append(q), original(q))[1]
+        code = inst.run_install(self._opts(zip_path, sha), env)
+        self.assertEqual(code, inst.EXIT_OK)
+        self.assertEqual(len(prompts), 1, "one confirmation must cover the kernel, the boot parameters and the reboot")
+        self.assertIn("REBOOT", prompts[0])
+        commands = self._commands()
+        apt = commands.index(["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", "ubuntu-realtime"])
+        self.assertEqual(commands[0][:4], ["install", "-d", "-m", "0700"], "the GRUB backup comes first")
+        self.assertTrue(all(c[0] in ("install", "cp") for c in commands[:apt]), "only backup steps before the kernel")
+        self.assertIn(["cp", "-a", str(self.grub_default), str(self.backup / "default-grub")], commands[:apt])
+        self.assertIn(["cp", "/proc/cmdline", str(self.backup / "cmdline-before")], commands[:apt])
+        self.assertEqual(commands[apt + 1][:4], ["install", "-D", "-m", "0644"])
+        self.assertEqual(commands[apt + 1][-1], str(self.dropin))
+        self.assertEqual(commands[apt + 2], ["update-grub"])
+        self.assertEqual(len(commands), apt + 4)
+        self.assertTrue(commands[-1][-1].endswith("install.sh"), "PROe is installed after the host preparation")
+        content = self.dropin.read_text()
+        self.assertIn('GRUB_CMDLINE_LINUX="$GRUB_CMDLINE_LINUX intel_iommu=on iommu=pt isolcpus=1,2', content)
+        self.assertIn("xe.force_probe=*", content)
+        self.assertNotIn("GRUB_DEFAULT", content, "the ubuntu-realtime package already makes the RT kernel default")
+        self.assertEqual(self.runner.captured[-1][:2], ["systemctl", "reboot"], "the reboot is the last step")
+        self.assertEqual(proe_state.read_install_state(self.state).state, proe_state.STATE_INSTALLED)
+        self.assertTrue((self.installed / "cli.dist" / "proe").exists())
+        self.assertFalse((self.state / "grub-dropin.tmp").exists())
+        self.assertIn("To revert", self._text())
+
+    def test_yes_covers_host_preparation_and_reboot(self):
+        self.rt = False
+        self.cmdline = STOCK_CMDLINE
+        zip_path, sha = self._package()
+        env = self._env(interactive=False, existing=lambda: [])
+        code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), env)
+        self.assertEqual(code, inst.EXIT_OK)
+        self.assertTrue(self._rebooted())
+
+    def test_only_boot_parameters_when_rt_kernel_already_runs(self):
+        self.cmdline = STOCK_CMDLINE
+        zip_path, sha = self._package()
+        env = self._env(interactive=False, existing=lambda: [])
+        code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), env)
+        self.assertEqual(code, inst.EXIT_OK)
+        commands = self._commands()
+        self.assertFalse(any("apt-get" in c for c in commands))
+        self.assertEqual([c[0] for c in commands][-3:], ["install", "update-grub", "bash"])
+        self.assertTrue(self.backup.exists())
+        self.assertTrue(self._rebooted())
+
+    def test_conflicting_boot_parameter_is_backed_up_then_replaced(self):
+        self.rt = False
+        self.cmdline = STOCK_CMDLINE
+        original = 'GRUB_CMDLINE_LINUX="isolcpus=3 nosmt"\n'
+        self.grub_default.write_text(original)
+        zip_path, sha = self._package()
+        code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), self._env(existing=lambda: []))
+        self.assertEqual(code, inst.EXIT_OK)
+        self.assertIn("replaces: isolcpus=1,2 (already configured as isolcpus=3)", self._text())
+        self.assertEqual(self.grub_default.read_text(), original, "the user's own GRUB file is not edited")
+        self.assertIn(["cp", "-a", str(self.grub_default), str(self.backup / "default-grub")], self._commands())
+        content = self.dropin.read_text()
+        self.assertIn('"isolcpus="*', content)
+        self.assertIn("isolcpus=1,2", content)
+        self.assertTrue(self._rebooted())
+
+    def test_existing_backup_is_kept_as_the_original(self):
+        self.cmdline = STOCK_CMDLINE
+        self.backup.mkdir()
+        zip_path, sha = self._package()
+        inst.run_install(self._opts(zip_path, sha, assume_yes=True), self._env(existing=lambda: []))
+        self.assertFalse(any(c[0] == "cp" for c in self._commands()))
+        self.assertIn("already backed up", self._text())
+
+    def test_other_grub_dropins_are_backed_up_but_not_our_own(self):
+        self.cmdline = STOCK_CMDLINE
+        other = self.grub / "grub.d" / "50-other.cfg"
+        other.write_text("GRUB_TIMEOUT=5\n")
+        self.dropin.write_text("# left by an earlier run\n")
+        zip_path, sha = self._package()
+        inst.run_install(self._opts(zip_path, sha, assume_yes=True), self._env(existing=lambda: []))
+        commands = self._commands()
+        self.assertIn(["cp", "-a", str(other), str(self.backup / "grub.d" / "50-other.cfg")], commands)
+        self.assertFalse(any(c[0] == "cp" and host_prep.DROPIN_NAME in " ".join(c) for c in commands))
+
+    def test_already_configured_parameter_is_not_duplicated(self):
+        self.cmdline = STOCK_CMDLINE
+        self.grub_default.write_text('GRUB_CMDLINE_LINUX="iommu=pt"\n')
+        zip_path, sha = self._package()
+        inst.run_install(self._opts(zip_path, sha, assume_yes=True), self._env(existing=lambda: []))
+        content = self.dropin.read_text()
+        self.assertNotIn(" iommu=pt", content)
+        self.assertIn("intel_iommu=on", content)
+
+    def test_host_preparation_failure_is_reported(self):
+        self.rt = False
+        self.cmdline = STOCK_CMDLINE
+        zip_path, sha = self._package()
+        env = self._env(runner=FakeRunner(self.installed, install_code=100), existing=lambda: [])
+        code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), env)
+        self.assertEqual(code, inst.EXIT_ERROR)
+        self.assertIn("exit code 100", self._text())
+        self.assertIsNone(proe_state.read_install_state(self.state))
+        self.assertFalse(self._rebooted())
+
+    def test_one_run_installs_everything_and_a_rerun_checks_the_host(self):
+        self._make_cli()
+        self.rt = False
+        self.cmdline = STOCK_CMDLINE
+        zip_path, sha = self._package(capabilities=syn.CAPABILITIES)
+        code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), self._env(existing=lambda: []))
+        self.assertEqual(code, inst.EXIT_OK)
+        self.assertTrue(self._rebooted())
+        self.assertIn("after the reboot", self._text())
+        self.assertEqual(len(proe_state.read_capability_record(self.state).profiles), 1)
+
+        # Not rebooted yet: nothing runs, the host is reported as not ready.
+        env = self._env()
+        self.assertEqual(inst.run_install(self._opts(zip_path, sha, assume_yes=True), env), inst.EXIT_ACTION_REQUIRED)
+        self.assertEqual(self.runner.streamed, [])
+        self.assertIn("not running a real-time kernel", self._text())
+
+        # Rebooted into a generic kernel: explain, still nothing runs.
+        self.boot = "boot-2"
+        env = self._env()
+        self.assertEqual(inst.run_install(self._opts(zip_path, sha, assume_yes=True), env), inst.EXIT_ACTION_REQUIRED)
+        self.assertEqual(self.runner.streamed, [])
+
+        # Real-time kernel runs but the boot parameters did not apply: explain.
+        self.rt = True
+        env = self._env()
+        self.assertEqual(inst.run_install(self._opts(zip_path, sha, assume_yes=True), env), inst.EXIT_ACTION_REQUIRED)
+        self.assertIn("command line is missing", self._text())
+
+        # Everything active: ready, and nothing was asked or run again.
+        self.cmdline = FULL_CMDLINE
+        env = self._env()
+        self.assertEqual(inst.run_install(self._opts(zip_path, sha), env), inst.EXIT_OK)
+        self.assertEqual(self.runner.streamed, [])
+        self.assertIn("Host readiness  : ready", self._text())
+
+    def test_preview_lists_the_whole_sequence_and_asks_once(self):
+        self.rt = False
+        self.cmdline = STOCK_CMDLINE
+        zip_path, sha = self._package()
+        inst.run_install(self._opts(zip_path, sha), self._env(answers=["n"]))
+        text = self._text()
+        self.assertIn("a real-time kernel and a reboot are REQUIRED", text)
+        self.assertIn("performance targets", text)
+        self.assertIn("check the generated GRUB configuration", text)
+        self.assertIn("reboot this machine, only if every check passed", text)
+        self.assertIn("This one command sets up PROe", text)
+
+    def test_sanity_check_of_the_boot_configuration_blocks_the_reboot(self):
+        self.rt = False
+        self.cmdline = STOCK_CMDLINE
+        (self.grub / "grub.cfg").write_text(
+            "menuentry 'Ubuntu' {\n\tlinux\t/boot/vmlinuz-7.0.0-42-generic root=/dev/sda1 ro quiet splash\n}\n"
+        )
+        zip_path, sha = self._package()
+        code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), self._env(existing=lambda: []))
+        self.assertEqual(code, inst.EXIT_ERROR)
+        self.assertIn("sanity check after the host preparation failed", self._text())
+        self.assertIn("no real-time kernel entry", self._text())
+        self.assertFalse(self._rebooted())
+        self.assertFalse(self.installed.exists(), "PROe is installed only after the host preparation checks out")
+        self.assertEqual(host_changes.read_host_changes(self.state).grub_dropin, str(self.dropin))
+
+    def test_sanity_check_passes_with_a_matching_boot_configuration(self):
+        self.rt = False
+        self.cmdline = STOCK_CMDLINE
+        params = " ".join(host_prep.BOOT_PARAMS)
+        (self.grub / "grub.cfg").write_text(
+            f"menuentry 'Ubuntu' {{\n\tlinux\t/boot/vmlinuz-6.8.1-1015-realtime root=/dev/sda1 ro quiet {params}\n}}\n"
+        )
+        zip_path, sha = self._package()
+        code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), self._env(existing=lambda: []))
+        self.assertEqual(code, inst.EXIT_OK)
+        self.assertIn("[4/7] Checking the GRUB configuration ... ok", self._text())
+        self.assertIn("boot parameters are in place", self._text())
+        self.assertTrue(self._rebooted())
+
+    def test_failed_vendor_installer_means_no_reboot(self):
+        self.rt = False
+        self.cmdline = STOCK_CMDLINE
+        zip_path, sha = self._package()
+        env = self._env(runner=FakeRunner(self.installed, installer_code=7), existing=lambda: [])
+        code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), env)
+        self.assertEqual(code, inst.EXIT_ERROR)
+        self.assertIn("exit code 7", self._text())
+        self.assertFalse(self._rebooted())
+        self.assertEqual(proe_state.read_install_state(self.state).state, proe_state.STATE_FAILED)
+
+    def test_package_reboot_and_host_preparation_share_one_reboot(self):
+        self._make_cli()
+        self.rt = False
+        self.cmdline = STOCK_CMDLINE
+        zip_path, sha = self._package(capabilities=self._reboot_caps())
+        env = self._env(interactive=False, existing=lambda: [])
+        code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), env)
+        self.assertEqual(code, inst.EXIT_ACTION_REQUIRED)
+        self.assertEqual(sum(c[:2] == ["systemctl", "reboot"] for c in self.runner.captured), 1)
+        self.assertEqual(proe_state.read_install_state(self.state).state, proe_state.STATE_AWAITING_REBOOT)
+
+    def test_cpupower_is_checked_after_the_reboot_when_the_kernel_changes(self):
+        self.rt = False
+        self.cmdline = STOCK_CMDLINE
+        zip_path, sha = self._package()
+        env = self._env(runner=FakeRunner(self.installed, cpupower_code=1), existing=lambda: [])
+        code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), env)
+        self.assertEqual(code, inst.EXIT_OK)
+        self.assertFalse(any(c[0] == "cpupower" for c in self.runner.captured))
+
+    def test_missing_host_tools_are_installed_before_the_vendor_installer(self):
+        self._make_cli()
+        self.missing_tools = {"tuna", "yanglint"}
+        zip_path, sha = self._package()
+        env = self._env(existing=lambda: [])
+        self.runner.hook = lambda argv: self.missing_tools.clear() if argv[0] == "ldconfig" else None
+        code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), env)
+        self.assertEqual(code, inst.EXIT_OK)
+        commands = self._commands()
+        self.assertEqual(commands[0], ["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "update"])
+        self.assertIn("tuna", commands[1])
+        self.assertIn("cmake", commands[1])
+        names = [c[0] for c in commands]
+        self.assertEqual(names[2:7], ["git", "cmake", "cmake", "cmake", "ldconfig"])
+        self.assertIn(host_prep.LIBYANG_TAG, commands[2])
+        self.assertTrue(commands[-1][-1].endswith("install.sh"))
+        build_dirs = [p.name for p in self.state.glob("libyang-*") if p.is_dir()]
+        self.assertEqual(build_dirs, [], "build directory must be removed")
+
+    def test_dependency_failure_stops_before_the_vendor_installer(self):
+        self.missing_tools = {"tuna"}
+        zip_path, sha = self._package()
+        env = self._env(runner=FakeRunner(self.installed, install_code=100), existing=lambda: [])
+        code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), env)
+        self.assertEqual(code, inst.EXIT_ERROR)
+        self.assertIn("exit code 100", self._text())
+        self.assertFalse(self.installed.exists())
+
+    def test_cpupower_must_work_with_the_running_kernel(self):
+        zip_path, sha = self._package()
+        env = self._env(runner=FakeRunner(self.installed, cpupower_code=1), existing=lambda: [])
+        code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), env)
+        self.assertEqual(code, inst.EXIT_ERROR)
+        self.assertIn("cpupower", self._text())
+        self.assertEqual(self.runner.streamed, [])
+
+    def test_progress_lines_name_each_phase_in_order(self):
+        self.rt = False
+        self.cmdline = STOCK_CMDLINE
+        zip_path, sha = self._package()
+        inst.run_install(self._opts(zip_path, sha, assume_yes=True), self._env(existing=lambda: []))
+        text = self._text()
+        expected = [
+            "[1/7] Backing up the GRUB configuration ... ok",
+            "[2/7] Installing the real-time kernel (ubuntu-realtime) ... ok",
+            "[3/7] Setting the boot parameters ... ok",
+            "[4/7] Checking the GRUB configuration ... skipped",
+            "[5/7] Verifying a private copy of the package ... ok",
+            "[6/7] Installing PROe ... ok",
+            "[7/7] Verifying the installation ... ok",
+        ]
+        positions = [text.index(line) for line in expected]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("      + ubuntu-realtime", text)
+
+    def test_the_commands_and_their_output_go_to_the_log(self):
+        self.rt = False
+        self.cmdline = STOCK_CMDLINE
+        zip_path, sha = self._package()
+        inst.run_install(self._opts(zip_path, sha, assume_yes=True), self._env(existing=lambda: []))
+        log = (self.state / "install.log").read_text()
+        self.assertIn("$ env DEBIAN_FRONTEND=noninteractive apt-get install -y ubuntu-realtime", log)
+        self.assertIn("$ update-grub", log)
+        self.assertIn("vendor log", log)
+        self.assertIn("Log              : " + str(self.state / "install.log"), self._text())
+
+    def test_a_failure_shows_the_last_lines_of_the_output(self):
+        zip_path, sha = self._package()
+        env = self._env(runner=FakeRunner(self.installed, installer_code=7), existing=lambda: [])
+        code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), env)
+        self.assertEqual(code, inst.EXIT_ERROR)
+        self.assertIn("Installing PROe ... FAILED", self._text())
+        self.assertIn("Last lines of the output:", self._text())
+        self.assertIn("    vendor log", self._text())
+
+    def test_a_failing_apt_step_shows_its_output_too(self):
+        self.missing_tools = {"tuna"}
+        zip_path, sha = self._package()
+        env = self._env(runner=FakeRunner(self.installed, install_code=100), existing=lambda: [])
+        code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), env)
+        self.assertEqual(code, inst.EXIT_ERROR)
+        self.assertIn("Installing the host tools: tuna ... FAILED", self._text())
+        self.assertIn("    vendor log", self._text())
+
+    def test_sudo_is_asked_for_once_before_the_first_phase(self):
+        zip_path, sha = self._package()
+        self._make_cli()
+        env = self._env(is_root=False, interactive=True, existing=lambda: [])
+        inst.run_install(self._opts(zip_path, sha, assume_yes=True), env)
+        self.assertEqual(self.runner.captured[0][:2], ["sudo", "-v"])
+        self.assertLess(self._text().index("sudo may ask"), self._text().index("[1/"))
+
+    def test_the_environment_prints_notes_directly_without_progress(self):
+        env = self._env()
+        with env.phase("Anything") as phase:
+            phase.note("a note")
+        self.assertEqual(self.out, ["a note"])
 
 
 class AvailabilityTests(unittest.TestCase):
