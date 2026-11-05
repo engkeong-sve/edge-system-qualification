@@ -9,14 +9,26 @@ from pathlib import Path
 from esq.utils.proe import host_changes, host_prep
 from esq.utils.proe import installer as inst
 from esq.utils.proe import state as proe_state
-from esq.utils.proe.availability import explain, is_available
+from esq.utils.proe.availability import resolve_profile
+from esq.utils.proe.constants import RT_KERNEL_PACKAGE, ProeError
 from esq.utils.proe.package import HostInfo
 
 from . import synthetic as syn
 
-SUPPORTED_PROFILE = "profile.suite.realtime.proe_1ms_ai"
+SUPPORTED_PROFILE = "profile.suite.realtime.proe_1ms_ai_single_dut"
 FULL_CMDLINE = "BOOT_IMAGE=/vmlinuz ro quiet splash " + " ".join(host_prep.BOOT_PARAMS)
 STOCK_CMDLINE = "BOOT_IMAGE=/vmlinuz ro quiet splash vt.handoff=7"
+RT = "7.0.0-38-realtime"
+# What 'apt-get install -y ubuntu-realtime' adds in the fake machine, in the order the installer records it.
+RT_PACKAGES = (f"linux-image-{RT}", RT_KERNEL_PACKAGE)
+
+
+def grub_cfg(params=" ".join(host_prep.BOOT_PARAMS)):
+    """A generated grub.cfg with a generic kernel and a real-time kernel."""
+    return (
+        "menuentry 'Ubuntu' {\n\tlinux\t/boot/vmlinuz-7.0.0-42-generic root=/dev/sda1 ro quiet splash\n}\n"
+        f"menuentry 'Ubuntu, with Linux {RT}' {{\n\tlinux\t/boot/vmlinuz-{RT} root=/dev/sda1 ro quiet {params}\n}}\n"
+    )
 
 
 class FakeRunner:
@@ -30,7 +42,6 @@ class FakeRunner:
         version_code=0,
         service="active",
         cpupower_code=0,
-        candidate="6.8.1-1015.16",
         installer_code=0,
     ):
         self.installed_root = installed_root
@@ -38,7 +49,6 @@ class FakeRunner:
         self.version_code = version_code
         self.service = service
         self.cpupower_code = cpupower_code
-        self.candidate = candidate
         self.installer_code = installer_code
         self.packages = {"bash"}
         self.hook = None
@@ -53,8 +63,8 @@ class FakeRunner:
             self.hook(list(argv))
         if self.install_code == 0 and "apt-get" in argv and "install" in argv:
             self.packages.update(a for a in argv[argv.index("install") + 1 :] if not a.startswith("-"))
-            if "ubuntu-realtime" in argv:
-                self.packages.add("linux-image-6.8.1-1015-realtime")
+            if RT_KERNEL_PACKAGE in argv:
+                self.packages.add(f"linux-image-{RT}")
         if self.install_code == 0 and argv[:3] == ["cmake", "--install", "libyang/build"]:
             manifest = Path(cwd) / "libyang" / "build" / "install_manifest.txt"
             manifest.parent.mkdir(parents=True, exist_ok=True)
@@ -78,10 +88,6 @@ class FakeRunner:
             return 0, "".join(f"ii \t{name}\n" for name in sorted(self.packages))
         if argv[0] == "cpupower":
             return self.cpupower_code, "cpupower 7.0\n"
-        if argv[0] == "apt-cache":
-            if self.candidate is None:
-                return 100, ""
-            return 0, f"linux-image-realtime:\n  Installed: (none)\n  Candidate: {self.candidate}\n  Version table:\n"
         if argv[-1] == "--version":
             return self.version_code, "proe 1.0.0\n"
         if argv[:2] == ["systemctl", "is-active"]:
@@ -102,7 +108,7 @@ class InstallerTests(unittest.TestCase):
         self.out = []
         self.boot = "boot-1"
         self.rt = True
-        self.release = "6.8.1-1015-realtime"
+        self.release = RT
         self.cmdline = FULL_CMDLINE
         self.missing_tools = set()
         self.grub = self.root / "grub"
@@ -113,13 +119,14 @@ class InstallerTests(unittest.TestCase):
         )
         self.dropin = self.grub / "grub.d" / host_prep.DROPIN_NAME
         self.backup = self.grub / "backup"
+        (self.grub / "grub.cfg").write_text(grub_cfg())
 
     def _env(self, runner=None, *, interactive=True, answers=(), existing=None, is_root=True, host=None):
         answers = list(answers)
         self.runner = runner or FakeRunner(self.installed)
         return inst.InstallEnvironment(
             runner=self.runner,
-            host=host or HostInfo("ubuntu", "24.04", "x86_64", "Ubuntu 24.04.4 LTS"),
+            host=host or HostInfo("ubuntu", "26.04", "x86_64", "Ubuntu 26.04 LTS"),
             is_root=is_root,
             interactive=interactive,
             prompt=lambda _q: answers.pop(0) if answers else "n",
@@ -182,9 +189,10 @@ class InstallerTests(unittest.TestCase):
 
     def test_incompatible_host_runs_nothing(self):
         zip_path, sha = self._package()
-        env = self._env(host=HostInfo("ubuntu", "26.04", "x86_64"))
+        env = self._env(host=HostInfo("ubuntu", "24.04", "x86_64", "Ubuntu 24.04.4 LTS"))
         code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), env)
         self.assertEqual(code, inst.EXIT_ERROR)
+        self.assertIn("26.04 or newer", self._text())
         self.assertEqual(self.runner.streamed, [])
 
     def test_declined_consent(self):
@@ -374,76 +382,46 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(code, inst.EXIT_ACTION_REQUIRED)
         text = self._text()
         self.assertIn("NOT running", text)
-        self.assertIn("ubuntu-realtime", text)
+        self.assertIn(f"apt-get install -y {RT_KERNEL_PACKAGE}", text)
+        self.assertIn("default boot entry", text)
         self.assertIn("isolcpus=1,2", text)
         self.assertIn(host_prep.DROPIN_NAME, text)
         self.assertIn("REQUIRED", text)
         self.assertEqual(self.runner.streamed, [])
         self.assertFalse(self.dropin.exists())
 
-    def test_preview_shows_the_minimum_and_what_apt_offers(self):
+    def test_preview_names_the_running_kernel_but_no_kernel_version_to_install(self):
         self.rt = False
+        self.release = "7.0.0-42-generic"
         self.cmdline = STOCK_CMDLINE
         zip_path, sha = self._package()
         inst.run_install(self._opts(zip_path, sha), self._env(answers=["n"]))
-        self.assertIn("minimum 6.8.1", self._text())
-        self.assertIn("apt offers 6.8.1-1015.16", self._text())
+        self.assertIn("this machine runs 7.0.0-42-generic", self._text())
+        self.assertIn("newest real-time kernel of this Ubuntu release", self._text())
 
-    def test_running_rt_kernel_older_than_the_minimum_is_prepared_again(self):
-        self.release = "6.6.0-1000-realtime"
-        zip_path, sha = self._package()
-        env = self._env(interactive=False, existing=lambda: [])
-        code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), env)
-        self.assertEqual(code, inst.EXIT_OK)
-        self.assertIn("TOO OLD (6.6.0-1000-realtime, minimum 6.8.1)", self._text())
-        self.assertTrue(any("ubuntu-realtime" in c for c in self._commands()))
-        self.assertTrue(self._rebooted())
+    def test_any_running_real_time_kernel_needs_no_kernel_change(self):
+        for release in (RT, "7.0.0-99-realtime", "6.8.1-1015-realtime"):
+            with self.subTest(release=release):
+                self.release = release
+                self.out.clear()
+                zip_path, sha = self._package()
+                self._make_cli()
+                env = self._env(existing=lambda: [])
+                self.assertEqual(inst.run_install(self._opts(zip_path, sha, assume_yes=True), env), inst.EXIT_OK)
+                self.assertIn("Real-time kernel : running", self._text())
+                self.assertFalse(any(RT_KERNEL_PACKAGE in c for c in self._commands()))
+                shutil.rmtree(self.installed, ignore_errors=True)
+                shutil.rmtree(self.state, ignore_errors=True)
 
-    def test_newer_rt_kernel_than_the_minimum_is_accepted(self):
-        self.release = "7.0.0-29-realtime"
-        zip_path, sha = self._package()
-        self._make_cli()
-        env = self._env(existing=lambda: [])
-        self.assertEqual(inst.run_install(self._opts(zip_path, sha, assume_yes=True), env), inst.EXIT_OK)
-        self.assertFalse(any("ubuntu-realtime" in c for c in self._commands()))
-
-    def test_apt_offering_an_older_kernel_stops_before_any_change(self):
-        self.rt = False
-        self.cmdline = STOCK_CMDLINE
-        zip_path, sha = self._package()
-        runner = FakeRunner(self.installed, candidate="6.6.0-1000.1")
-        env = self._env(runner=runner, existing=lambda: [])
-        code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), env)
-        self.assertEqual(code, inst.EXIT_ERROR)
-        self.assertIn("apt only offers 6.6.0-1000.1", self._text())
-        self.assertEqual(runner.streamed, [])
-        self.assertFalse(self.state.exists())
-        self.assertFalse(self._rebooted())
-
-    def test_unknown_apt_candidate_does_not_block_the_preparation(self):
-        self.rt = False
-        self.cmdline = STOCK_CMDLINE
-        zip_path, sha = self._package()
-        runner = FakeRunner(self.installed, candidate=None)
-        env = self._env(runner=runner, existing=lambda: [])
-        code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), env)
-        self.assertEqual(code, inst.EXIT_OK)
-        self.assertTrue(any("ubuntu-realtime" in c for c in self._commands()))
-
-    def test_rerun_after_a_reboot_into_an_old_rt_kernel_explains(self):
+    def test_apt_index_is_refreshed_so_that_the_latest_real_time_kernel_is_installed(self):
         self.rt = False
         self.cmdline = STOCK_CMDLINE
         zip_path, sha = self._package()
         inst.run_install(self._opts(zip_path, sha, assume_yes=True), self._env(existing=lambda: []))
-        self.boot = "boot-2"
-        self.rt = True
-        self.release = "6.6.0-1000-realtime"
-        self.cmdline = FULL_CMDLINE
-        env = self._env()
-        code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), env)
-        self.assertEqual(code, inst.EXIT_ACTION_REQUIRED)
-        self.assertIn("older than the required 6.8.1", self._text())
-        self.assertEqual(self.runner.streamed, [])
+        commands = self._commands()
+        update = ["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "update"]
+        install = ["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", RT_KERNEL_PACKAGE]
+        self.assertEqual(commands.index(install), commands.index(update) + 1)
 
     def test_host_preparation_is_recorded_for_uninstall(self):
         self.rt = False
@@ -452,7 +430,7 @@ class InstallerTests(unittest.TestCase):
         env = self._env(interactive=False, existing=lambda: [])
         inst.run_install(self._opts(zip_path, sha, assume_yes=True), env)
         record = host_changes.read_host_changes(self.state)
-        self.assertEqual(record.kernel_packages, ("linux-image-6.8.1-1015-realtime", "ubuntu-realtime"))
+        self.assertEqual(record.kernel_packages, RT_PACKAGES)
         self.assertEqual(record.tool_packages, ())
         self.assertEqual(record.grub_dropin, str(self.dropin))
         self.assertEqual(record.grub_backup, str(self.backup))
@@ -485,16 +463,30 @@ class InstallerTests(unittest.TestCase):
         inst.run_install(self._opts(zip_path, sha, assume_yes=True), env)
         self.assertEqual(host_changes.read_host_changes(self.state).tool_packages, ())
 
+    def _pending_uninstall(self, zip_path, sha, boot):
+        name = "proe-binary-ubuntu26.04-x86_64-12538f28"
+        state = proe_state.InstallState(proe_state.STATE_UNINSTALL_REBOOT, sha, name, boot)
+        proe_state.write_install_state(state, self.state)
+
     def test_install_is_refused_while_an_uninstall_waits_for_a_reboot(self):
         zip_path, sha = self._package()
-        proe_state.write_install_state(
-            proe_state.InstallState(proe_state.STATE_UNINSTALL_REBOOT, sha, "proe-binary-ubuntu24.04-x86_64-12538f28"),
-            self.state,
-        )
+        self._pending_uninstall(zip_path, sha, boot=self.boot)
         env = self._env(interactive=False, existing=lambda: [])
         code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), env)
         self.assertEqual(code, inst.EXIT_ERROR)
+        self.assertIn("is waiting for a reboot of this machine", self._text())
         self.assertIn("esq uninstall proe", self._text())
+        self.assertEqual(self.runner.streamed, [])
+
+    def test_after_the_reboot_the_message_asks_for_the_uninstall_not_another_reboot(self):
+        zip_path, sha = self._package()
+        self._pending_uninstall(zip_path, sha, boot="boot-before-the-reboot")
+        env = self._env(interactive=False, existing=lambda: [])
+        code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), env)
+        self.assertEqual(code, inst.EXIT_ERROR)
+        self.assertIn("already rebooted", self._text())
+        self.assertIn("run 'esq uninstall proe' to finish it", self._text())
+        self.assertNotIn("waiting for a reboot", self._text())
         self.assertEqual(self.runner.streamed, [])
 
     def test_host_preparation_declined_changes_nothing(self):
@@ -522,9 +514,13 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(len(prompts), 1, "one confirmation must cover the kernel, the boot parameters and the reboot")
         self.assertIn("REBOOT", prompts[0])
         commands = self._commands()
-        apt = commands.index(["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", "ubuntu-realtime"])
+        kernel = ["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", RT_KERNEL_PACKAGE]
+        apt = commands.index(kernel)
+        self.assertEqual(commands[apt - 1], ["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "update"])
         self.assertEqual(commands[0][:4], ["install", "-d", "-m", "0700"], "the GRUB backup comes first")
-        self.assertTrue(all(c[0] in ("install", "cp") for c in commands[:apt]), "only backup steps before the kernel")
+        self.assertTrue(
+            all(c[0] in ("install", "cp") for c in commands[: apt - 1]), "only backup steps before the kernel"
+        )
         self.assertIn(["cp", "-a", str(self.grub_default), str(self.backup / "default-grub")], commands[:apt])
         self.assertIn(["cp", "/proc/cmdline", str(self.backup / "cmdline-before")], commands[:apt])
         self.assertEqual(commands[apt + 1][:4], ["install", "-D", "-m", "0644"])
@@ -669,25 +665,34 @@ class InstallerTests(unittest.TestCase):
     def test_sanity_check_of_the_boot_configuration_blocks_the_reboot(self):
         self.rt = False
         self.cmdline = STOCK_CMDLINE
+        (self.grub / "grub.cfg").write_text(grub_cfg(params="quiet"))
+        zip_path, sha = self._package()
+        code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), self._env(existing=lambda: []))
+        self.assertEqual(code, inst.EXIT_ERROR)
+        self.assertIn("sanity check after the host preparation failed", self._text())
+        self.assertIn("boot parameter isolcpus=1,2 is not on any real-time kernel entry", self._text())
+        self.assertFalse(self._rebooted())
+        self.assertFalse(self.installed.exists(), "PROe is installed only after the host preparation checks out")
+        self.assertEqual(host_changes.read_host_changes(self.state).grub_dropin, str(self.dropin))
+
+    def test_a_missing_real_time_kernel_entry_stops_before_the_reboot(self):
+        self.rt = False
+        self.cmdline = STOCK_CMDLINE
         (self.grub / "grub.cfg").write_text(
             "menuentry 'Ubuntu' {\n\tlinux\t/boot/vmlinuz-7.0.0-42-generic root=/dev/sda1 ro quiet splash\n}\n"
         )
         zip_path, sha = self._package()
         code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), self._env(existing=lambda: []))
         self.assertEqual(code, inst.EXIT_ERROR)
-        self.assertIn("sanity check after the host preparation failed", self._text())
-        self.assertIn("no real-time kernel entry", self._text())
+        self.assertIn("it has no real-time kernel entry", self._text())
+        self.assertIn("esq uninstall proe", self._text())
         self.assertFalse(self._rebooted())
-        self.assertFalse(self.installed.exists(), "PROe is installed only after the host preparation checks out")
-        self.assertEqual(host_changes.read_host_changes(self.state).grub_dropin, str(self.dropin))
+        self.assertFalse(self.installed.exists())
+        self.assertEqual(host_changes.read_host_changes(self.state).kernel_packages, RT_PACKAGES, "revertible")
 
     def test_sanity_check_passes_with_a_matching_boot_configuration(self):
         self.rt = False
         self.cmdline = STOCK_CMDLINE
-        params = " ".join(host_prep.BOOT_PARAMS)
-        (self.grub / "grub.cfg").write_text(
-            f"menuentry 'Ubuntu' {{\n\tlinux\t/boot/vmlinuz-6.8.1-1015-realtime root=/dev/sda1 ro quiet {params}\n}}\n"
-        )
         zip_path, sha = self._package()
         code = inst.run_install(self._opts(zip_path, sha, assume_yes=True), self._env(existing=lambda: []))
         self.assertEqual(code, inst.EXIT_OK)
@@ -770,16 +775,16 @@ class InstallerTests(unittest.TestCase):
         text = self._text()
         expected = [
             "[1/7] Backing up the GRUB configuration ... ok",
-            "[2/7] Installing the real-time kernel (ubuntu-realtime) ... ok",
+            f"[2/7] Installing the real-time kernel ({RT_KERNEL_PACKAGE}) ... ok",
             "[3/7] Setting the boot parameters ... ok",
-            "[4/7] Checking the GRUB configuration ... skipped",
+            "[4/7] Checking the GRUB configuration ... ok",
             "[5/7] Verifying a private copy of the package ... ok",
             "[6/7] Installing PROe ... ok",
             "[7/7] Verifying the installation ... ok",
         ]
         positions = [text.index(line) for line in expected]
         self.assertEqual(positions, sorted(positions))
-        self.assertIn("      + ubuntu-realtime", text)
+        self.assertIn(f"      + linux-image-{RT}", text)
 
     def test_the_commands_and_their_output_go_to_the_log(self):
         self.rt = False
@@ -787,7 +792,8 @@ class InstallerTests(unittest.TestCase):
         zip_path, sha = self._package()
         inst.run_install(self._opts(zip_path, sha, assume_yes=True), self._env(existing=lambda: []))
         log = (self.state / "install.log").read_text()
-        self.assertIn("$ env DEBIAN_FRONTEND=noninteractive apt-get install -y ubuntu-realtime", log)
+        install = f"$ env DEBIAN_FRONTEND=noninteractive apt-get install -y {RT_KERNEL_PACKAGE}"
+        self.assertIn(install, log)
         self.assertIn("$ update-grub", log)
         self.assertIn("vendor log", log)
         self.assertIn("Log              : " + str(self.state / "install.log"), self._text())
@@ -825,7 +831,16 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(self.out, ["a note"])
 
 
-class AvailabilityTests(unittest.TestCase):
+def explain(esq_profile, directory):
+    """Why resolve_profile refuses a profile, or None when it resolves."""
+    try:
+        resolve_profile(esq_profile, directory)
+    except ProeError as exc:
+        return str(exc)
+    return None
+
+
+class ProfileResolutionTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
@@ -852,7 +867,7 @@ class AvailabilityTests(unittest.TestCase):
     def test_not_installed(self):
         self.assertIn("not installed", explain(SUPPORTED_PROFILE, self.dir))
 
-    def test_available_when_verified(self):
+    def test_resolves_when_verified(self):
         self._publish()
         self.assertIsNone(explain(SUPPORTED_PROFILE, self.dir))
 
@@ -860,11 +875,11 @@ class AvailabilityTests(unittest.TestCase):
         self._publish()
         self.assertIn("does not support", explain("profile.suite.realtime.proe_control", self.dir))
 
-    def test_incomplete_install_hides_profiles(self):
+    def test_incomplete_install_is_refused(self):
         self._publish(state=proe_state.STATE_AWAITING_REBOOT)
         self.assertIn("incomplete", explain(SUPPORTED_PROFILE, self.dir))
 
-    def test_missing_executable_hides_profiles(self):
+    def test_missing_executable_is_refused(self):
         self._publish()
         self.cli.unlink()
         self.assertIn("missing", explain(SUPPORTED_PROFILE, self.dir))
@@ -877,20 +892,11 @@ class AvailabilityTests(unittest.TestCase):
             proe_state.read_capability_record(self.dir)
         self.assertIsNotNone(explain(SUPPORTED_PROFILE, self.dir))
 
-    def test_corrupt_record_hides_profiles(self):
+    def test_corrupt_record_is_refused(self):
         self._publish()
         (self.dir / "capability.json").write_text("{not json")
         self.assertIsNotNone(explain(SUPPORTED_PROFILE, self.dir))
 
-    def test_entry_point_function_uses_state_dir(self):
-        import os
-        from unittest import mock
-
-        with mock.patch.dict(os.environ, {"ESQ_STATE_DIR": str(self.dir / "home")}):
-            self.assertFalse(is_available(SUPPORTED_PROFILE, {}))
-            self._publish(directory=self.dir / "home" / "proe")
-            self.assertTrue(is_available(SUPPORTED_PROFILE, {}))
-            self.assertFalse(is_available("profile.suite.realtime.proe_control", {}))
 
 
 if __name__ == "__main__":

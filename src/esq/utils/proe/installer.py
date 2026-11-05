@@ -11,8 +11,9 @@ Sequence (nothing is executed before the checksum and the package contents are v
 3. detect an existing installation (idempotent re-run, resume, or explicit conflict),
 4. show a preview of exactly what will happen and obtain consent,
 5. when the host is not ready, prepare it without rebooting: back up the GRUB configuration, install the
-   ``ubuntu-realtime`` kernel (the package makes it the default boot entry), add the boot parameters PROe
-   needs, replacing conflicting values, and check the generated GRUB configuration,
+   ``ubuntu-realtime`` kernel (the newest real-time kernel of this Ubuntu release; the package makes it
+   the default boot entry), add the boot parameters PROe needs, replacing conflicting values, and check
+   the generated GRUB configuration,
 6. install the host tools and ``libyang`` that the PROe README lists and the package does not include,
 7. stage a verified private copy, re-verify it, then run the vendor ``install.sh`` with privileges,
 8. verify the installed files, executable and service, and only then write the capability record,
@@ -23,6 +24,19 @@ command again only reports whether the host is ready. ESQ never uninstalls, over
 modifies an existing installation on its own, and never reboots without consent. A reboot that a package
 declares needs a separate consent unless the host preparation already asked for one. All other system effects
 are performed by the vendor installer that ships inside the verified package.
+
+Consent: the preview is always printed first. ``--yes`` answers the one question, host preparation and reboot
+included; ``--allow-reboot`` is the separate consent for a reboot that a package itself requires. A no, or a
+non-interactive run without ``--yes``, changes nothing. The host preparation reboots only after every
+earlier step and check passed, so a failure never leaves a reboot pending.
+
+Existing installations: the same package again is verified and nothing is reinstalled. PROe files of another
+package or of an incomplete attempt stop the command with an explanation: remove them with ``esq uninstall
+proe`` when ESQ installed them, otherwise with the ``uninstall.sh`` of the package that did. While an
+``esq uninstall proe`` is unfinished, the command refuses to install and says whether the machine still has to
+reboot or the uninstall only has to be run again.
+
+Exit codes: 0 ok, 1 error, 2 action required. The log is ``install.log`` in the ESQ state directory.
 """
 
 import logging
@@ -269,9 +283,14 @@ def _run(options: InstallOptions, env: InstallEnvironment) -> int:
     existing = env.existing_paths()
 
     if previous is not None and previous.state == proe_state.STATE_UNINSTALL_REBOOT:
+        if env.boot_id() and env.boot_id() != previous.detail:
+            raise InstallError(
+                "A previous 'esq uninstall proe' has not finished. The machine was already rebooted, so do not "
+                "reboot again: run 'esq uninstall proe' to finish it, then install PROe again."
+            )
         raise InstallError(
-            "A previous 'esq uninstall proe' is waiting for a reboot. Reboot, then run 'esq uninstall proe' "
-            "again to finish it, before you install PROe again."
+            "A previous 'esq uninstall proe' is waiting for a reboot of this machine. Reboot, then run "
+            "'esq uninstall proe' again to finish it, before you install PROe again."
         )
     if existing:
         return _handle_existing(env, manifest, previous, existing, directory)
@@ -330,9 +349,7 @@ class _Prep:
     rt_missing: bool
     boot: host_prep.BootParamPlan
     cmdline_missing: Tuple[str, ...]
-    rt_too_old: bool = False
     rt_release: str = ""
-    rt_candidate: Optional[str] = None
 
     @property
     def needed(self) -> bool:
@@ -341,31 +358,12 @@ class _Prep:
 
 def _plan_prep(env: InstallEnvironment) -> _Prep:
     boot = host_prep.plan_boot_params(host_prep.read_configured_tokens(env.grub_default, env.grub_dropin_dir))
-    release = env.kernel_release()
-    is_rt = env.rt_kernel_active()
-    too_old = is_rt and not host_prep.kernel_at_least(release)
-    rt_missing = not is_rt or too_old
-    candidate = _rt_kernel_candidate(env) if rt_missing else None
-    if candidate is not None and not host_prep.kernel_at_least(candidate):
-        raise InstallError(
-            f"PROe needs a real-time kernel {host_prep.format_version(host_prep.MIN_RT_KERNEL)} or newer, but apt "
-            f"only offers {candidate}. Nothing was changed. Enable a repository that provides a newer real-time "
-            "kernel, then run this command again."
-        )
     return _Prep(
-        rt_missing=rt_missing,
+        rt_missing=not env.rt_kernel_active(),
         boot=boot,
         cmdline_missing=tuple(host_prep.missing_from_cmdline(env.read_cmdline())),
-        rt_too_old=too_old,
-        rt_release=release,
-        rt_candidate=candidate,
+        rt_release=env.kernel_release(),
     )
-
-
-def _rt_kernel_candidate(env: InstallEnvironment) -> Optional[str]:
-    """Newest real-time kernel version that apt can install, or None when it cannot be determined."""
-    code, output = env.runner.capture(["apt-cache", "policy", host_prep.RT_KERNEL_PROBE_PACKAGE], 30)
-    return host_prep.parse_apt_candidate(output) if code == 0 else None
 
 
 def _host_problems(env: InstallEnvironment) -> List[str]:
@@ -375,12 +373,6 @@ def _host_problems(env: InstallEnvironment) -> List[str]:
             "This machine is not running a real-time kernel. If it has not been rebooted since the installation, "
             "reboot it. If it was, select the '-realtime' kernel in the boot menu (GRUB: Advanced options for "
             "Ubuntu), then run 'esq install proe' again to confirm."
-        )
-    elif not host_prep.kernel_at_least(env.kernel_release()):
-        problems.append(
-            f"This machine is running real-time kernel {env.kernel_release()}, older than the required "
-            f"{host_prep.format_version(host_prep.MIN_RT_KERNEL)}. Select a newer '-realtime' kernel in the boot "
-            "menu (GRUB: Advanced options for Ubuntu), then run 'esq install proe' again to confirm."
         )
     missing = host_prep.missing_from_cmdline(env.read_cmdline())
     if missing:
@@ -451,17 +443,13 @@ def _print_preview(
         changes.extend(caps.system_changes)
     lines.extend(f"  - {change}" for change in changes)
 
-    minimum = host_prep.format_version(host_prep.MIN_RT_KERNEL)
     if prep is None or not prep.rt_missing:
-        lines.append(f"Real-time kernel : running (minimum {minimum})")
+        lines.append("Real-time kernel : running")
     else:
-        status = f"NOT running (minimum {minimum})"
-        if prep.rt_too_old:
-            status = f"TOO OLD ({prep.rt_release}, minimum {minimum})"
-        offer = f" apt offers {prep.rt_candidate}." if prep.rt_candidate else ""
         lines.append(
-            f"Real-time kernel : {status}.{offer} ESQ will run 'apt-get install -y {RT_KERNEL_PACKAGE}' (about 10 "
-            "packages); the package makes it the default boot entry."
+            f"Real-time kernel : NOT running (this machine runs {prep.rt_release}). ESQ will run "
+            f"'apt-get install -y {RT_KERNEL_PACKAGE}' (the newest real-time kernel of this Ubuntu release, about "
+            "10 packages); the package makes it the default boot entry."
         )
     if prep is None or not prep.cmdline_missing:
         lines.append("Boot parameters  : active")
@@ -519,8 +507,8 @@ def _print_preview(
 
     if caps is None or not caps.profiles:
         lines.append(
-            "ESQ profiles     : NONE. This package does not declare any single-DUT profile that this ESQ version "
-            "supports, so no PROe profile will be listed or runnable after installation."
+            "ESQ profiles     : NONE. This package does not declare any single-DUT 2-NIC profile that this ESQ "
+            "version supports, so no PROe profile can run after installation."
         )
     else:
         lines.append("ESQ profiles     : " + ", ".join(p.esq_profile for p in caps.profiles))
@@ -761,6 +749,7 @@ def _prepare_host(env: InstallEnvironment, directory: Path, prep: _Prep) -> None
         host_changes.update_host_changes(directory, grub_backup=str(env.grub_backup_dir))
     if prep.rt_missing:
         with env.phase(f"Installing the real-time kernel ({RT_KERNEL_PACKAGE})") as phase:
+            _step(env, _apt(["update"]), log_path, directory, privileged=True)
             before = installed_packages(env)
             _step(env, _apt(["install", "-y", RT_KERNEL_PACKAGE]), log_path, directory, privileged=True)
             _note_added(phase, _record_added(env, directory, before, kernel=True))
@@ -926,16 +915,16 @@ def _finalize(
     if profiles:
         env.out("Profiles         : " + ", ".join(p.esq_profile for p in profiles))
     else:
-        env.out("Profiles         : none (the package declares no supported single-DUT profile)")
+        env.out("Profiles         : none (the package declares no supported single-DUT 2-NIC profile)")
     host_code = EXIT_OK if reboot_pending else _check_host(env)
     if not profiles:
         env.out("Ready            : NO. Installed, but ESQ cannot run PROe benchmarks from this package.")
     elif reboot_pending:
-        env.out("Ready           : after the reboot. Then run 'esq list' to see them and 'esq run' to execute one.")
+        env.out("Ready            : after the reboot. Then run 'esq run' to execute a PROe profile.")
     elif host_code != EXIT_OK:
         env.out("Ready            : NO. Fix the host problems above first.")
     else:
-        env.out("Ready           : run 'esq list' to see them and 'esq run' to execute one.")
+        env.out("Ready            : run 'esq run' to execute a PROe profile.")
     env.out(f"Log              : {directory / 'install.log'}")
     return host_code
 

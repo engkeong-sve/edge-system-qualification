@@ -29,7 +29,7 @@ class PackageValidationTests(unittest.TestCase):
         zip_path, sha = syn.build_package(self.dir)
         manifest = self._inspect(zip_path, sha)
         self.assertEqual(manifest.package_name, syn.PACKAGE_NAME)
-        self.assertEqual(manifest.os_version, "24.04")
+        self.assertEqual(manifest.os_version, "26.04")
         self.assertEqual(manifest.arch, "x86_64")
         self.assertEqual(manifest.source_commit, "a" * 40)
         self.assertIsNone(manifest.capabilities)
@@ -153,7 +153,7 @@ class PackageValidationTests(unittest.TestCase):
 
     def test_os_version_file_must_match_name(self):
         files = dict(syn.DEFAULT_FILES)
-        files["assets/ubuntu-version"] = b"26.04\n"
+        files["assets/ubuntu-version"] = b"24.04\n"
         zip_path, sha = syn.build_package(self.dir, files=files)
         with self.assertRaisesRegex(PackageError, "inconsistent"):
             self._inspect(zip_path, sha)
@@ -253,19 +253,30 @@ class CompatibilityTests(unittest.TestCase):
         self.manifest = pkg.inspect_archive(zip_path, sha)
 
     def test_matching_host(self):
-        host = pkg.HostInfo("ubuntu", "24.04", "x86_64")
+        host = pkg.HostInfo("ubuntu", "26.04", "x86_64")
         self.assertEqual(pkg.check_host_compatibility(self.manifest, host), [])
 
-    def test_other_ubuntu_release(self):
-        problems = pkg.check_host_compatibility(self.manifest, pkg.HostInfo("ubuntu", "26.04", "x86_64"))
-        self.assertTrue(any("built for Ubuntu 24.04" in p for p in problems))
+    def test_a_later_ubuntu_release_needs_its_own_package(self):
+        problems = pkg.check_host_compatibility(self.manifest, pkg.HostInfo("ubuntu", "26.10", "x86_64"))
+        self.assertEqual(len(problems), 1)
+        self.assertIn("built for Ubuntu 26.04", problems[0])
+
+    def test_releases_before_26_04_are_refused(self):
+        problems = pkg.check_host_compatibility(self.manifest, pkg.HostInfo("ubuntu", "24.04", "x86_64"))
+        self.assertTrue(any("Unsupported operating system" in p and "26.04 or newer" in p for p in problems))
+
+    def test_os_version_supported(self):
+        for version in ("26.04", "26.10", "27.04", "30.04"):
+            self.assertTrue(pkg.os_version_supported(version), version)
+        for version in ("24.04", "25.10", "22.04", "26", "", "abc", "x.y"):
+            self.assertFalse(pkg.os_version_supported(version), version)
 
     def test_unsupported_os(self):
         problems = pkg.check_host_compatibility(self.manifest, pkg.HostInfo("fedora", "40", "x86_64"))
         self.assertTrue(any("Unsupported operating system" in p for p in problems))
 
     def test_wrong_architecture(self):
-        problems = pkg.check_host_compatibility(self.manifest, pkg.HostInfo("ubuntu", "24.04", "aarch64"))
+        problems = pkg.check_host_compatibility(self.manifest, pkg.HostInfo("ubuntu", "26.04", "aarch64"))
         self.assertTrue(any("architecture" in p for p in problems))
 
 
@@ -275,9 +286,9 @@ class CapabilityTests(unittest.TestCase):
             "schema": "esq-proe-capabilities/1",
             "profiles": [
                 {
-                    "esq_profile": "profile.suite.realtime.proe_1ms_ai",
+                    "esq_profile": "profile.suite.realtime.proe_1ms_ai_single_dut",
                     "proe_profile": "1ms_ai",
-                    "topology": "single-dut",
+                    "topology": "single-dut-dual-nic",
                     "report_schema": "1.0",
                 }
             ],

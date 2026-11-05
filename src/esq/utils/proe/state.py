@@ -11,6 +11,12 @@ Two small JSON files live in the user's ESQ state directory:
                           truth for which ESQ profiles are available
 
 Both are written atomically with owner-only permissions and are validated on every read.
+
+The state directory is ``$ESQ_STATE_DIR/proe`` when that variable is set, otherwise
+``$XDG_STATE_HOME/esq/proe`` (by default ``~/.local/state/esq/proe``). It also holds the host changes that
+``esq uninstall proe`` reverts and the logs ``install.log`` and ``uninstall.log``. A finished uninstall deletes
+everything there except ``uninstall.log``. The install state records the boot id when a reboot is pending, so
+that a command can tell 'still waiting for the reboot' from 'rebooted'.
 """
 
 import json
@@ -28,7 +34,7 @@ from esq.utils.proe.constants import (
     PROE_PROFILE_ID_RE,
     REPORT_CONTRACTS,
     SHA256_RE,
-    TOPOLOGY_SINGLE_DUT,
+    TOPOLOGY_SINGLE_DUT_DUAL_NIC,
     StateError,
 )
 
@@ -167,7 +173,7 @@ class CapabilityRecord:
                 {
                     "esq_profile": p.esq_profile,
                     "proe_profile": p.proe_profile,
-                    "topology": TOPOLOGY_SINGLE_DUT,
+                    "topology": TOPOLOGY_SINGLE_DUT_DUAL_NIC,
                     "report_schema": p.report_schema,
                 }
                 for p in self.profiles
@@ -222,7 +228,7 @@ def read_capability_record(directory: Optional[Path] = None) -> Optional[Capabil
             esq_profile not in KNOWN_PROFILES
             or not isinstance(proe_profile, str)
             or not PROE_PROFILE_ID_RE.match(proe_profile)
-            or entry.get("topology") != TOPOLOGY_SINGLE_DUT
+            or entry.get("topology") != TOPOLOGY_SINGLE_DUT_DUAL_NIC
             or schema not in REPORT_CONTRACTS
         ):
             raise StateError("The PROe capability record lists a profile that this ESQ version does not support.")

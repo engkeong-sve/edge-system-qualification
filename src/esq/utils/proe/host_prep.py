@@ -9,6 +9,27 @@ The PROe binary package does not include these, so ``esq install proe`` prepares
 - a real-time kernel and the kernel boot parameters PROe needs (GRUB),
 - the host tools and ``libyang`` that the PROe README lists as prerequisites.
 
+Real-time kernel: ``apt-get install -y ubuntu-realtime`` installs the newest real-time kernel of the running
+Ubuntu release (no Ubuntu Pro subscription is needed) and makes it the default boot entry. ESQ names no kernel
+version. Before it installs anything, ESQ checks with ``apt-cache policy`` that apt offers the package.
+
+Boot parameters: :data:`BOOT_PARAMS` are written to ``/etc/default/grub.d/99-esq-proe.cfg``, never to
+``/etc/default/grub`` or another drop-in. A parameter that is already set is not added again. A parameter that
+is set to a different value, for example ``isolcpus=3``, is shown in the preview as ``replaces: ...`` and the
+drop-in removes the old value from ``GRUB_CMDLINE_LINUX`` and ``GRUB_CMDLINE_LINUX_DEFAULT`` first. Parameters
+that PROe does not set are kept. After ``update-grub``, the generated ``/boot/grub/grub.cfg`` must contain a
+real-time kernel entry that carries every parameter.
+
+Backup and revert: before the first change, ESQ copies ``/etc/default/grub``, the other drop-ins and the running
+kernel command line to ``/var/backups/esq/proe-grub/`` (``default-grub``, ``grub.d/``, ``cmdline-before``). An
+existing backup is the original and is never overwritten. To revert by hand, delete the drop-in and run
+``update-grub``; ``esq uninstall proe`` does this and removes what ESQ installed.
+
+Host tools: the PROe package expects ``git``, ``tc``, ``ethtool``, ``ptp4l``, ``phc2sys``, ``tuna``, ``cpupower``,
+``rdmsr``, ``wrmsr``, ``ssh-audit`` and ``yanglint`` (:data:`TOOL_PACKAGES`). ESQ installs the missing ones with
+``apt-get``. ``libyang`` is built from source (:data:`LIBYANG_TAG`) and installed to ``/usr/local``. Without
+ESQ's step, the PROe installer stops with ``Missing required host tool`` before it changes anything.
+
 This module only plans and renders. Running commands stays in :mod:`esq.utils.proe.installer`.
 """
 
@@ -42,11 +63,6 @@ BOOT_PARAMS: Tuple[str, ...] = (
 )
 # Parameters the kernel accepts more than once; a different existing value is not a conflict.
 REPEATABLE_KEYS = frozenset({"console", "modprobe.blacklist"})
-
-# PROe needs a real-time kernel of at least this version (major, minor, patch).
-MIN_RT_KERNEL = (6, 8, 1)
-# apt metapackage whose candidate version is the newest real-time kernel that apt can install.
-RT_KERNEL_PROBE_PACKAGE = "linux-image-realtime"
 
 GRUB_DEFAULT_FILE = "/etc/default/grub"
 GRUB_DROPIN_DIR = "/etc/default/grub.d"
@@ -85,10 +101,13 @@ LIBYANG_BUILD_PACKAGES: Tuple[str, ...] = (
 
 _ASSIGN_RE = re.compile(r"""^\s*(?:export\s+)?GRUB_CMDLINE_LINUX(?:_DEFAULT)?=(?:"([^"]*)"|'([^']*)')\s*(?:#.*)?$""")
 _SAFE_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
-_VERSION_RE = re.compile(r"^(\d+)\.(\d+)(?:\.(\d+))?")
-_CANDIDATE_RE = re.compile(r"^\s*Candidate:\s*(\S+)\s*$", re.MULTILINE)
+_SAFE_ENTRY_RE = re.compile(r"^[A-Za-z0-9_.>-]+$")
 _REMOVAL_RE = re.compile(r"^(?:Remv|Purg) (\S+)", re.MULTILINE)
 _GRUB_LINUX_RE = re.compile(r"^\s*linux(?:efi)?\s+(\S+)(.*)$", re.MULTILINE)
+_GRUB_SUBMENU_RE = re.compile(r"^submenu\s+'[^']*'.*?\$menuentry_id_option\s+'([^']+)'", re.MULTILINE)
+_GRUB_ENTRY_RE = re.compile(
+    r"^([ \t]*)menuentry\s+'([^']*)'.*?\$menuentry_id_option\s+'([^']+)'", re.MULTILINE
+)
 
 
 def _key(token: str) -> str:
@@ -141,31 +160,6 @@ def plan_boot_params(configured: Sequence[str], wanted: Sequence[str] = BOOT_PAR
     return BootParamPlan(tuple(add), tuple(present), tuple(conflicts), tuple(replace_keys))
 
 
-def parse_kernel_version(text: str) -> Optional[Tuple[int, int, int]]:
-    """Numeric version at the start of a kernel release or package version, e.g. ``6.8.1-1015-realtime``."""
-    match = _VERSION_RE.match(text.strip())
-    if match is None:
-        return None
-    return int(match.group(1)), int(match.group(2)), int(match.group(3) or 0)
-
-
-def kernel_at_least(text: str, minimum: Sequence[int] = MIN_RT_KERNEL) -> bool:
-    version = parse_kernel_version(text)
-    return version is not None and version >= tuple(minimum)
-
-
-def format_version(version: Sequence[int]) -> str:
-    return ".".join(str(part) for part in version)
-
-
-def parse_apt_candidate(policy_output: str) -> Optional[str]:
-    """The ``Candidate:`` version from ``apt-cache policy`` output, or None when there is none."""
-    match = _CANDIDATE_RE.search(policy_output)
-    if match is None or match.group(1) == "(none)":
-        return None
-    return match.group(1)
-
-
 def parse_apt_removals(simulation_output: str) -> List[str]:
     """Package names that ``apt-get -s remove`` or ``purge`` says it would remove."""
     return _REMOVAL_RE.findall(simulation_output)
@@ -174,6 +168,31 @@ def parse_apt_removals(simulation_output: str) -> List[str]:
 def missing_from_cmdline(cmdline: str, wanted: Sequence[str] = BOOT_PARAMS) -> List[str]:
     running = set(cmdline.split())
     return [token for token in wanted if token not in running]
+
+
+def grub_default_entry(text: str, release: str) -> Optional[str]:
+    """The ``GRUB_DEFAULT`` value that boots kernel ``release`` (not its recovery mode), or None.
+
+    An entry that sits in the ``Advanced options`` submenu is addressed as ``submenu>entry``.
+    """
+    submenus = [(m.start(), m.group(1)) for m in _GRUB_SUBMENU_RE.finditer(text)]
+    for match in _GRUB_ENTRY_RE.finditer(text):
+        indent, title, entry_id = match.groups()
+        if not title.endswith(f"Linux {release}"):
+            continue
+        parents = [sub_id for start, sub_id in submenus if start < match.start()]
+        # An indented entry sits inside the 'Advanced options' submenu and is addressed as submenu>entry.
+        return f"{parents[-1]}>{entry_id}" if indent and parents else entry_id
+    return None
+
+
+def grub_normal_kernel_entry(text: str) -> Optional[str]:
+    """The ``GRUB_DEFAULT`` value of the newest installed kernel that is not a real-time kernel, or None."""
+    for match in _GRUB_LINUX_RE.finditer(text):
+        release = match.group(1).rsplit("vmlinuz-", 1)[-1]
+        if "vmlinuz-" in match.group(1) and "realtime" not in release:
+            return grub_default_entry(text, release)
+    return None
 
 
 def grub_cfg_problems(text: str, wanted: Sequence[str], need_rt_kernel: bool) -> List[str]:
@@ -194,8 +213,10 @@ def grub_cfg_problems(text: str, wanted: Sequence[str], need_rt_kernel: bool) ->
     return problems
 
 
-def render_dropin(params: Sequence[str], replace_keys: Sequence[str] = ()) -> str:
+def render_dropin(params: Sequence[str], replace_keys: Sequence[str] = (), default_entry: str = "") -> str:
     """Content of the GRUB drop-in. Remove the file and run update-grub to undo it."""
+    if default_entry and not _SAFE_ENTRY_RE.match(default_entry):
+        raise InstallError(f"Refusing to write an unsafe GRUB boot entry: {default_entry!r}")
     for value in params:
         if any(ch in value for ch in '"`$\\\n'):
             raise InstallError(f"Refusing to write an unsafe GRUB value: {value!r}")
@@ -203,6 +224,11 @@ def render_dropin(params: Sequence[str], replace_keys: Sequence[str] = ()) -> st
         if not _SAFE_KEY_RE.match(key):
             raise InstallError(f"Refusing to write an unsafe GRUB parameter name: {key!r}")
     lines = ["# Written by 'esq install proe'. Remove this file and run update-grub to undo it."]
+    if default_entry:
+        lines += [
+            "# Boot the normal kernel next, so that the real-time kernel can be removed.",
+            f'GRUB_DEFAULT="{default_entry}"',
+        ]
     added = " ".join(params)
     if replace_keys:
         patterns = "|".join(f'"{key}="*' for key in replace_keys)

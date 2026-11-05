@@ -10,7 +10,7 @@ part of this repository. This package contains only generic, safe interfaces:
 - ``package``       Checksum, archive-safety and manifest validation of a local package
 - ``installer``     Consent-driven installation orchestration (``esq install proe``)
 - ``state``         Persistent installation state and verified capability record
-- ``availability``  Profile discovery filter (only supported, installed profiles are listed)
+- ``availability``  Resolves an ESQ PROe profile to the installed, verified package
 - ``report``        Strict parser for the structured PROe benchmark report
 - ``adapter``       Thin PROe CLI adapter that maps a report to native ESQ results
 

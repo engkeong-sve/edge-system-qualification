@@ -13,6 +13,17 @@ Nothing in the package is executed or trusted until:
 
 The in-package manifest is only as trustworthy as the ZIP itself, so authenticity comes from the
 trusted ZIP checksum. The manifest additionally detects corruption and unexpected content.
+
+The host must match the package: Ubuntu 26.04 or newer on x86_64, and the same OS release and architecture
+that the package was built for.
+
+Package support contract: the optional ``esq-capabilities.json`` is how a package gives ESQ evidence that it
+supports an ESQ profile. ESQ never infers support from an installed PROe command or a version string. For each
+profile the package names the PROe profile that the ESQ profile maps to (for example ``1ms_ai_single_dut``), the
+report schema version that a run produces and the topology. Only a single DUT with two NICs is supported
+(``single-dut-dual-nic``, the name PROe uses), and a package can only choose from the ESQ profiles in
+``KNOWN_PROFILES``. Without this evidence the package still installs and is verified, but no PROe profile can
+run.
 """
 
 import hashlib
@@ -45,8 +56,8 @@ from esq.utils.proe.constants import (
     SHA256_RE,
     SUPPORTED_ARCH,
     SUPPORTED_OS_ID,
-    SUPPORTED_OS_VERSIONS,
-    TOPOLOGY_SINGLE_DUT,
+    MIN_OS_VERSION,
+    TOPOLOGY_SINGLE_DUT_DUAL_NIC,
     KNOWN_PROFILES,
     PackageError,
 )
@@ -324,7 +335,7 @@ def parse_capabilities(data: Dict[str, Any]) -> Capabilities:
 
         if esq_profile not in KNOWN_PROFILES:
             unsupported.append(f"{esq_profile}: not defined by this ESQ version")
-        elif topology != TOPOLOGY_SINGLE_DUT:
+        elif topology != TOPOLOGY_SINGLE_DUT_DUAL_NIC:
             unsupported.append(f"{esq_profile}: unsupported topology '{topology}'")
         elif report_schema not in REPORT_CONTRACTS:
             unsupported.append(f"{esq_profile}: unsupported report schema '{report_schema}'")
@@ -358,14 +369,22 @@ def detect_host() -> HostInfo:
     )
 
 
+def os_version_supported(version: str) -> bool:
+    """Whether an Ubuntu ``VERSION_ID`` such as ``26.04`` is at least :data:`MIN_OS_VERSION`."""
+    parts = version.split(".")
+    if len(parts) < 2 or not (parts[0].isdigit() and parts[1].isdigit()):
+        return False
+    return (int(parts[0]), int(parts[1])) >= MIN_OS_VERSION
+
+
 def check_host_compatibility(manifest: PackageManifest, host: HostInfo) -> List[str]:
     """Return the reasons why the package cannot be installed on ``host``. Empty means compatible."""
     problems: List[str] = []
-    if host.os_id != SUPPORTED_OS_ID or host.os_version not in SUPPORTED_OS_VERSIONS:
-        supported = ", ".join(SUPPORTED_OS_VERSIONS)
+    if host.os_id != SUPPORTED_OS_ID or not os_version_supported(host.os_version):
+        supported = f"{MIN_OS_VERSION[0]}.{MIN_OS_VERSION[1]:02d}"
         problems.append(
             f"Unsupported operating system '{host.pretty_name or host.os_id + ' ' + host.os_version}'; "
-            f"supported: Ubuntu {supported}."
+            f"supported: Ubuntu {supported} or newer."
         )
     if host.arch != SUPPORTED_ARCH:
         problems.append(f"Unsupported architecture '{host.arch}'; supported: {SUPPORTED_ARCH}.")

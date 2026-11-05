@@ -9,10 +9,19 @@ record lists, finds the structured report that this exact run produced, and pars
 It never fabricates a value and never reuses an earlier report: only a report file that did not exist
 before the run started and whose profile and timestamp match the run is accepted.
 
+A run is an error, not a result, when the PROe service is not active, the run times out (one hour by default),
+no new report or more than one new report appears, the report is older than the run or belongs to another
+profile, a field is missing, null, not finite or has an unexpected unit, type or status value, or the exit code
+and the report status contradict each other. The command, its output and the raw report are attached to the
+ESQ report as evidence. Network and clock settings belong to the PROe profile of the installed package, not to
+ESQ.
+
 The command form ``proe profile run-benchmark <profile>`` is only used for a profile that an installed
-package declared as single-DUT. It must not be read as evidence that any PROe revision supports a
-single-DUT run: a package whose benchmark needs extra arguments is never listed, so this adapter
-is never reached for it.
+package declared as single DUT with two NICs (PROe topology ``single-dut-dual-nic``, for example the PROe
+profile ``1ms_ai_single_dut``). PROe picks that topology itself when no remote credentials are given, and
+takes the two NIC names from the installed PROe profile file, so ESQ passes no NIC or credential option. It
+must not be read as evidence that any PROe revision supports such a run: a package whose benchmark needs
+extra arguments is never accepted, so this adapter is never reached for it.
 """
 
 import json

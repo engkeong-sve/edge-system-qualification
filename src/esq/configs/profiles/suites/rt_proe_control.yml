@@ -4,8 +4,7 @@
 name: "profile.suite.realtime.proe_control"
 description: "PROe control-loop real-time benchmark (optional native PROe backend)"
 version: "1.0.0"
-# Listed and runnable only when an installed, verified PROe package declares support for this profile.
-requires_backend: "proe"
+# Needs the optional PROe backend: 'esq install proe'. The run stops with that hint when PROe is not installed.
 params:
   labels:
     profile_display_name: "Real-Time PROe Control"

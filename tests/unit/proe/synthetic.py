@@ -10,12 +10,12 @@ import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-PACKAGE_NAME = "proe-binary-ubuntu24.04-x86_64-aaaaaaaa"
+PACKAGE_NAME = "proe-binary-ubuntu26.04-x86_64-aaaaaaaa"
 
 DEFAULT_FILES: Dict[str, bytes] = {
     "install.sh": b"#!/bin/bash\necho synthetic installer\n",
     "uninstall.sh": b"#!/bin/bash\necho synthetic uninstaller\n",
-    "assets/ubuntu-version": b"24.04\n",
+    "assets/ubuntu-version": b"26.04\n",
     "assets/conf/proe_app.conf": b"Results:\n    ResultsDirectory: /var/log/proe/benchmark_results\n",
     "cli.dist/proe": b"synthetic cli placeholder",
     "daemon.dist/proe": b"synthetic daemon placeholder",
@@ -27,9 +27,9 @@ CAPABILITIES = {
     "system_changes": ["synthetic change"],
     "profiles": [
         {
-            "esq_profile": "profile.suite.realtime.proe_1ms_ai",
+            "esq_profile": "profile.suite.realtime.proe_1ms_ai_single_dut",
             "proe_profile": "1ms_ai",
-            "topology": "single-dut",
+            "topology": "single-dut-dual-nic",
             "report_schema": "1.0",
         }
     ],

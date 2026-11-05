@@ -62,9 +62,6 @@ sysagent_suites = "esq"
 sysagent_configs = "esq"
 sysagent_telemetry = "esq.utils.telemetry.modules"
 
-[project.entry-points."sysagent.profile_availability"]
-proe = "esq.utils.proe.availability:is_available"
-
 [project.entry-points.pytest11]
 sysagent_plugin = "sysagent.utils.plugins"
 

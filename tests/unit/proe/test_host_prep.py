@@ -11,6 +11,8 @@ from pathlib import Path
 from esq.utils.proe import host_prep
 from esq.utils.proe.constants import InstallError
 
+RT = "7.0.0-38-realtime"
+
 
 class GrubConfigTests(unittest.TestCase):
     PARAMS = ("isolcpus=1,2", "nowatchdog")
@@ -22,27 +24,82 @@ class GrubConfigTests(unittest.TestCase):
             for image, args in entries
         )
 
-    def test_a_real_time_entry_with_every_parameter_is_accepted(self):
-        text = self._cfg(("7.0.0-42-generic", "quiet"), ("6.8.1-1015-realtime", "quiet isolcpus=1,2 nowatchdog"))
+    def test_a_real_time_kernel_entry_with_every_parameter_is_accepted(self):
+        text = self._cfg(("7.0.0-42-generic", "quiet"), (RT, "quiet isolcpus=1,2 nowatchdog"))
         self.assertEqual(host_prep.grub_cfg_problems(text, self.PARAMS, True), [])
 
-    def test_a_missing_real_time_entry_is_reported(self):
+    def test_a_missing_real_time_kernel_entry_is_reported(self):
         text = self._cfg(("7.0.0-42-generic", "quiet isolcpus=1,2 nowatchdog"))
-        self.assertEqual(host_prep.grub_cfg_problems(text, self.PARAMS, True)[0], "it has no real-time kernel entry")
+        problems = host_prep.grub_cfg_problems(text, self.PARAMS, True)
+        self.assertEqual(problems[0], "it has no real-time kernel entry")
 
-    def test_parameters_must_be_on_the_real_time_entry(self):
-        text = self._cfg(("7.0.0-42-generic", "isolcpus=1,2 nowatchdog"), ("6.8.1-1015-realtime", "quiet"))
+    def test_parameters_must_be_on_the_real_time_kernel_entry(self):
+        text = self._cfg(("7.0.0-42-generic", "isolcpus=1,2 nowatchdog"), (RT, "quiet"))
         problems = host_prep.grub_cfg_problems(text, self.PARAMS, True)
         self.assertEqual(len(problems), 2)
         self.assertIn("isolcpus=1,2", problems[0])
+        self.assertIn("real-time kernel entry", problems[0])
 
     def test_without_a_kernel_change_any_entry_counts(self):
-        text = self._cfg(("6.8.1-1015-realtime", "quiet isolcpus=1,2 nowatchdog"))
+        text = self._cfg(("7.0.0-42-generic", "quiet isolcpus=1,2 nowatchdog"))
         self.assertEqual(host_prep.grub_cfg_problems(text, self.PARAMS, False), [])
 
     def test_a_file_without_kernel_entries_is_reported(self):
         problems = host_prep.grub_cfg_problems("set timeout=0\n", self.PARAMS, True)
         self.assertEqual(problems, ["it contains no kernel entry"])
+
+
+class DefaultEntryTests(unittest.TestCase):
+    OPTION = "--class ubuntu $menuentry_id_option"
+    ADVANCED = "gnulinux-advanced-U"
+    GENERIC = "7.0.0-30-generic"
+
+    @staticmethod
+    def _entry(release, recovery=False):
+        suffix = " (recovery mode)" if recovery else ""
+        kind = "recovery" if recovery else "advanced"
+        return (
+            f"\tmenuentry 'Ubuntu, with Linux {release}{suffix}' {DefaultEntryTests.OPTION} "
+            f"'gnulinux-{release}-{kind}-U' {{\n\t\tlinux\t/boot/vmlinuz-{release} root=/dev/sda1 ro\n\t}}\n"
+        )
+
+    def _submenu_cfg(self, *releases):
+        """The best kernel on top, then every kernel in the Advanced options submenu, newest first."""
+        text = (
+            f"menuentry 'Ubuntu' {self.OPTION} 'gnulinux-simple-U' {{\n"
+            f"\tlinux /boot/vmlinuz-{releases[0]} root=/dev/sda1 ro\n}}\n"
+            f"submenu 'Advanced options for Ubuntu' $menuentry_id_option '{self.ADVANCED}' {{\n"
+        )
+        for release in releases:
+            text += self._entry(release) + self._entry(release, recovery=True)
+        return text + "}\n"
+
+    def test_an_entry_in_the_advanced_submenu_is_addressed_through_the_submenu(self):
+        entry = host_prep.grub_default_entry(self._submenu_cfg(RT, self.GENERIC), RT)
+        self.assertEqual(entry, f"{self.ADVANCED}>gnulinux-{RT}-advanced-U")
+
+    def test_the_recovery_entry_is_never_chosen(self):
+        text = self._submenu_cfg(RT).replace(f"'gnulinux-{RT}-advanced-U'", "'other-id'")
+        entry = host_prep.grub_default_entry(text, RT)
+        self.assertNotIn("recovery", entry or "")
+        self.assertEqual(entry, f"{self.ADVANCED}>other-id")
+
+    def test_a_top_level_entry_is_addressed_by_its_own_id(self):
+        text = f"menuentry 'Ubuntu, with Linux {RT}' {self.OPTION} 'gnulinux-{RT}-advanced-U' {{\n}}\n"
+        self.assertEqual(host_prep.grub_default_entry(text, RT), f"gnulinux-{RT}-advanced-U")
+
+    def test_a_kernel_without_an_entry_gives_none(self):
+        self.assertIsNone(host_prep.grub_default_entry(self._submenu_cfg(RT), "7.0.0-99-realtime"))
+        self.assertIsNone(host_prep.grub_default_entry("set timeout=0\n", RT))
+
+    def test_the_normal_kernel_entry_skips_every_real_time_kernel(self):
+        text = self._submenu_cfg(RT, "7.0.0-36-realtime", self.GENERIC, "7.0.0-28-generic")
+        entry = host_prep.grub_normal_kernel_entry(text)
+        self.assertEqual(entry, f"{self.ADVANCED}>gnulinux-{self.GENERIC}-advanced-U")
+
+    def test_the_normal_kernel_entry_is_none_when_only_real_time_kernels_exist(self):
+        self.assertIsNone(host_prep.grub_normal_kernel_entry(self._submenu_cfg(RT, "7.0.0-36-realtime")))
+        self.assertIsNone(host_prep.grub_normal_kernel_entry("set timeout=0\n"))
 
 
 class BootParamTests(unittest.TestCase):
@@ -120,6 +177,20 @@ class DropinTests(unittest.TestCase):
         self.assertIn('GRUB_CMDLINE_LINUX="$(_esq_drop "$GRUB_CMDLINE_LINUX") isolcpus=1,2"', text)
         self.assertIn('GRUB_CMDLINE_LINUX_DEFAULT="$(_esq_drop "$GRUB_CMDLINE_LINUX_DEFAULT")"', text)
 
+    def test_render_selects_the_default_boot_entry(self):
+        entry = "gnulinux-advanced-U>gnulinux-7.0.0-29-realtime-advanced-U"
+        text = host_prep.render_dropin(["isolcpus=1,2"], default_entry=entry)
+        self.assertIn(f'GRUB_DEFAULT="{entry}"', text)
+        self.assertIn('GRUB_CMDLINE_LINUX="$GRUB_CMDLINE_LINUX isolcpus=1,2"', text)
+        only_entry = host_prep.render_dropin([], default_entry=entry)
+        self.assertIn(f'GRUB_DEFAULT="{entry}"', only_entry)
+        self.assertNotIn("GRUB_CMDLINE_LINUX", only_entry)
+
+    def test_render_refuses_an_unsafe_default_boot_entry(self):
+        for bad in ('a"b', "a$b", "a b", "a`b", "a\nb"):
+            with self.assertRaises(InstallError):
+                host_prep.render_dropin([], default_entry=bad)
+
     def test_render_refuses_shell_metacharacters(self):
         for bad in ('a"b', "a$b", "a`b", "a\\b", "a\nb"):
             with self.assertRaises(InstallError):
@@ -143,36 +214,6 @@ class DropinTests(unittest.TestCase):
             argv = ["sh", "-c", command, "sh", path.as_posix()]
             result = subprocess.run(argv, env=env, capture_output=True, text=True)
         self.assertEqual(result.stdout, "nosmt isolcpus=1,2 xe.force_probe=*|quiet splash", result.stderr)
-
-
-class KernelVersionTests(unittest.TestCase):
-    def test_parse_kernel_version(self):
-        self.assertEqual(host_prep.parse_kernel_version("6.8.1-1015-realtime"), (6, 8, 1))
-        self.assertEqual(host_prep.parse_kernel_version("7.0.0-38-generic"), (7, 0, 0))
-        self.assertEqual(host_prep.parse_kernel_version("6.8-rc1"), (6, 8, 0))
-        self.assertEqual(host_prep.parse_kernel_version("6.8.1-1015.16"), (6, 8, 1))
-        self.assertIsNone(host_prep.parse_kernel_version("garbage"))
-        self.assertIsNone(host_prep.parse_kernel_version(""))
-
-    def test_kernel_at_least_the_minimum(self):
-        self.assertEqual(host_prep.MIN_RT_KERNEL, (6, 8, 1))
-        self.assertTrue(host_prep.kernel_at_least("6.8.1-1015-realtime"))
-        self.assertTrue(host_prep.kernel_at_least("6.8.2-1-realtime"))
-        self.assertTrue(host_prep.kernel_at_least("6.10.0-1-realtime"))
-        self.assertTrue(host_prep.kernel_at_least("7.0.0-29-realtime"))
-        self.assertFalse(host_prep.kernel_at_least("6.8.0-1-realtime"))
-        self.assertFalse(host_prep.kernel_at_least("6.6.1-1-realtime"))
-        self.assertFalse(host_prep.kernel_at_least("5.15.0-rt"))
-        self.assertFalse(host_prep.kernel_at_least("unknown"))
-
-    def test_format_version(self):
-        self.assertEqual(host_prep.format_version((6, 8, 1)), "6.8.1")
-
-    def test_parse_apt_candidate(self):
-        output = "linux-image-realtime:\n  Installed: (none)\n  Candidate: 6.8.1-1015.16\n  Version table:\n"
-        self.assertEqual(host_prep.parse_apt_candidate(output), "6.8.1-1015.16")
-        self.assertIsNone(host_prep.parse_apt_candidate("x:\n  Installed: (none)\n  Candidate: (none)\n"))
-        self.assertIsNone(host_prep.parse_apt_candidate(""))
 
 
 class DependencyTests(unittest.TestCase):

@@ -7,20 +7,27 @@ Orchestration of ``esq uninstall proe``.
 Undoes what ``esq install proe`` did, using the record that the installer kept in the ESQ state directory:
 
 1. refuse to touch a PROe installation that ESQ did not install,
-2. show a preview of exactly what will be removed and obtain one consent,
+2. show a preview of exactly what will be removed and obtain one consent (``--yes`` answers it, ``--keep-data``
+   keeps ``/etc/proe`` and ``/var/log/proe``),
 3. remove PROe: the service, the ``proe`` command, ``/opt/proe``, ``/etc/proe`` and ``/var/log/proe``,
 4. purge the apt packages that the installer added (host tools), after a simulation shows that apt would remove
-   nothing else,
+   nothing else; if it would, those packages are left installed and ESQ names them,
 5. remove the files that the libyang source build installed, and the PROe GRUB drop-in, then run ``update-grub``,
-6. purge the real-time kernel. A running real-time kernel cannot be removed, so the ``ubuntu-realtime`` package
-   (which makes it the default boot entry) is removed first and the machine reboots; the same command finishes
-   the removal after the reboot without asking again,
-7. delete the ESQ state for PROe.
+6. purge the real-time kernel packages that the installer added. A running kernel cannot be removed, and the
+   newest real-time kernel is the default boot entry again once the drop-in is gone (GRUB sorts by version).
+   So while the real-time kernel runs, ESQ rewrites the drop-in to boot the newest normal kernel, runs
+   ``update-grub`` and reboots. The state file records the boot id, so the same command can tell 'still waiting
+   for the reboot' from 'rebooted, finish now'. After the reboot, running the command again finishes the
+   removal without a second question and deletes the drop-in,
+7. delete the ESQ state for PROe, except the uninstall log.
 
 Every step checks the current state of the machine, so the command can be repeated after an interruption. ESQ
-never removes packages or files that it did not add, and it keeps the GRUB backup.
+never removes packages or files that it did not add, and it keeps the GRUB backup in
+``/var/backups/esq/proe-grub``. A PROe installation that ESQ did not install is never touched. Exit codes: 0
+finished, 1 error, 2 action required (declined, reboot pending, or some steps could not be completed).
 """
 
+import os
 import shutil
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -28,7 +35,7 @@ from pathlib import Path
 
 from esq.utils.proe import host_changes, host_prep
 from esq.utils.proe import state as proe_state
-from esq.utils.proe.constants import RT_KERNEL_PACKAGE, VENDOR_SERVICE_NAME, InstallError, ProeError
+from esq.utils.proe.constants import VENDOR_SERVICE_NAME, InstallError, ProeError
 from esq.utils.proe.installer import (
     EXIT_ACTION_REQUIRED,
     EXIT_ERROR,
@@ -66,7 +73,6 @@ class _Plan:
     tool_packages: tuple[str, ...]
     libyang_files: tuple[str, ...]
     dropin: str
-    meta_packages: tuple[str, ...]
     kernel_packages: tuple[str, ...]
     rt_running: bool
     packages_unknown: bool
@@ -173,7 +179,6 @@ def _plan(
             f for f in host_changes.libyang_files(directory, recorded, env.libyang_root) if env.exists(f)
         ),
         dropin=recorded.grub_dropin if recorded.grub_dropin and env.exists(recorded.grub_dropin) else "",
-        meta_packages=tuple(p for p in kernel if p == RT_KERNEL_PACKAGE),
         kernel_packages=kernel,
         rt_running=rt_running,
         packages_unknown=packages_unknown,
@@ -199,14 +204,19 @@ def _print_preview(
         lines.append("Host tools       : purge " + " ".join(plan.tool_packages) + " (installed by ESQ)")
     if plan.libyang_files:
         lines.append(f"libyang          : remove {len(plan.libyang_files)} files that ESQ built and installed")
-    if plan.dropin:
+    if _switches_kernel(plan):
+        lines.append(
+            "Boot parameters  : remove them and set the next boot to the normal kernel (the ESQ GRUB drop-in is "
+            "rewritten, and deleted when the removal finishes)"
+        )
+    elif plan.dropin:
         lines.append(f"Boot parameters  : delete {plan.dropin} and run update-grub")
     if plan.kernel_packages:
         text = "purge " + " ".join(plan.kernel_packages) + " (installed by ESQ)"
         if plan.rt_running:
             text += (
-                ". The real-time kernel is running, so ESQ first removes the package that makes it the default, "
-                "reboots, and finishes the removal when you run this command again (no second question)"
+                ". The real-time kernel is running, so ESQ first sets the next boot to the normal kernel, reboots, "
+                "and finishes the removal when you run this command again (no second question)"
             )
         lines.append("Real-time kernel : " + text)
     if plan.packages_unknown:
@@ -252,14 +262,19 @@ def _purge(
     return True
 
 
+def _switches_kernel(plan: _Plan) -> bool:
+    """Whether the real-time kernel runs and must be replaced by a normal kernel before it can be purged."""
+    return plan.rt_running and bool(plan.kernel_packages) and not plan.packages_unknown
+
+
 def _count_phases(plan: _Plan) -> int:
     """The number of numbered phases that the uninstall shows."""
-    removes_packages = bool(plan.kernel_packages) and not plan.packages_unknown
+    removes_packages = bool(plan.kernel_packages) and not plan.packages_unknown and not plan.rt_running
     return (
         int(bool(plan.proe_paths or plan.service or plan.link))
         + int(bool(plan.tool_packages) and not plan.packages_unknown)
         + int(bool(plan.libyang_files))
-        + int(bool(plan.dropin))
+        + int(bool(plan.dropin) or _switches_kernel(plan))
         + int(removes_packages)
         + int(bool(plan.dropin or plan.kernel_packages))
     )
@@ -292,20 +307,24 @@ def _execute(
     if plan.libyang_files:
         with env.phase("Removing libyang") as phase:
             _remove_libyang(env, directory, log_path, plan, phase)
-    if plan.dropin:
+    switched = False
+    if plan.dropin or _switches_kernel(plan):
         with env.phase("Removing the boot parameters") as phase:
-            _step(env, ["rm", "-f", "--", plan.dropin], log_path, directory, privileged=True)
-            phase.note(f"Deleted {plan.dropin}.")
+            if _switches_kernel(plan):
+                switched = _boot_normal_kernel_next(env, directory, log_path, plan, recorded, phase)
+            if not switched and plan.dropin:
+                _step(env, ["rm", "-f", "--", plan.dropin], log_path, directory, privileged=True)
+                phase.note(f"Deleted {plan.dropin}.")
+    if switched:
+        return _reboot_before_kernel_removal(env, directory, log_path, previous)
 
     if plan.kernel_packages and not plan.packages_unknown:
         if plan.rt_running:
-            with env.phase("Removing the real-time kernel package") as phase:
-                label = "real-time kernel package"
-                purged = _purge(env, directory, log_path, plan.meta_packages, allowed, label, phase)
-                if not purged:
-                    phase.result = "skipped"
-            if purged:
-                return _reboot_before_kernel_removal(env, directory, log_path, previous)
+            env.out(
+                "WARNING: the real-time kernel is running and no normal kernel is installed to boot instead, so it "
+                "is left installed. Install one (for example: apt-get install linux-generic), reboot into it, then "
+                "run this command again."
+            )
             incomplete = True
         else:
             with env.phase("Removing the real-time kernel") as phase:
@@ -352,6 +371,39 @@ def _remove_libyang(env: InstallEnvironment, directory: Path, log_path: Path, pl
     phase.note(f"{len(files)} files removed.")
 
 
+def _boot_normal_kernel_next(
+    env: InstallEnvironment,
+    directory: Path,
+    log_path: Path,
+    plan: _Plan,
+    recorded: host_changes.HostChanges,
+    phase: Phase,
+) -> bool:
+    """Rewrite the ESQ GRUB drop-in so that the next boot is the newest normal kernel. False when there is none.
+
+    Without this, GRUB would boot the real-time kernel again after the reboot, because it sorts first by version.
+    """
+    try:
+        text = env.grub_cfg.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    entry = host_prep.grub_normal_kernel_entry(text)
+    if entry is None:
+        return False
+    dropin = plan.dropin or recorded.grub_dropin or str(env.grub_dropin_dir / host_prep.DROPIN_NAME)
+    staged = directory / "grub-dropin.tmp"
+    fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(host_prep.render_dropin((), (), entry))
+    try:
+        _step(env, ["install", "-D", "-m", "0644", str(staged), dropin], log_path, directory, privileged=True)
+    finally:
+        staged.unlink(missing_ok=True)
+    host_changes.update_host_changes(directory, grub_dropin=dropin)
+    phase.note(f"Rewrote {dropin} so that the next boot is the normal kernel.")
+    return True
+
+
 def _reboot_before_kernel_removal(
     env: InstallEnvironment, directory: Path, log_path: Path, previous: proe_state.InstallState | None
 ) -> int:
@@ -363,7 +415,12 @@ def _reboot_before_kernel_removal(
     proe_state.write_install_state(state, directory)
     env.out("The real-time kernel cannot be removed while it is running. Rebooting now. After the machine is back,")
     env.out("run the same 'esq uninstall proe' command to finish removing the real-time kernel.")
-    env.runner.capture(_privileged(env, ["systemctl", "reboot"]), 60)
+    code, output = env.runner.capture(_privileged(env, ["systemctl", "reboot"]), 60)
+    if code != 0:
+        env.out(
+            f"The reboot command failed ({output.strip()[:200]}). Reboot this machine manually, then run the "
+            "same 'esq uninstall proe' command."
+        )
     return EXIT_ACTION_REQUIRED
 
 

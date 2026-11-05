@@ -13,7 +13,7 @@ from esq.utils.proe import state as proe_state
 from esq.utils.proe.constants import ProeError, ReportError
 from esq.utils.proe.report import check_run_consistency, parse_report, parse_report_text
 
-SUPPORTED_PROFILE = "profile.suite.realtime.proe_1ms_ai"
+SUPPORTED_PROFILE = "profile.suite.realtime.proe_1ms_ai_single_dut"
 
 # Synthetic report in the structure of schema 1.0 (invented numbers).
 GOOD_REPORT = {
