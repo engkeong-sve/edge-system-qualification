@@ -63,6 +63,7 @@ The following table describes each component in the stack, from the application 
 | **Applications and Components** | Workloads and services exercised by test cases — OpenVINO™ toolkit, Intel® DL Streamer*, OVMS*, vLLM*, and custom applications |
 | **Test Cases** | Individual parameterized test cases within each suite, each targeting a specific workload or use case |
 | **Test Suites** | Domain-specific test suites — AI, Vision, System, Real-Time, Vertical, and extensible custom suite types |
+| **Optional Backends** | Native components that some profiles use, such as the optional [PROe](suites/proe.md) real-time backend, installed separately with `esq install` |
 | **CLI** | Intel® ESQ command-line interface — the primary entry point for running tests, managing profiles, and viewing results |
 | **Runtimes** | Docker*, Python*, and Node.js* runtime environments required for test execution and containerized workloads |
 | **Operating System** | Ubuntu* as the supported base Linux* distribution |

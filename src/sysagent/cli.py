@@ -85,7 +85,8 @@ def _main() -> int:
     configure_logging(verbose=verbose, debug=debug)
 
     # Skip dependency verification for deps command or commands that don't need it
-    skip_deps = args.command == "deps" or not hasattr(args, "command")
+    # The installer verifies its own prerequisites and must work before benchmark dependencies exist
+    skip_deps = args.command in ("deps", "install", "uninstall") or not hasattr(args, "command")
 
     # GitHub repo downloads (e.g. allure3) are only needed to generate reports. "run" downloads
     # inside run_tests, right after the network readiness check, so only "report" needs it here;
@@ -164,6 +165,24 @@ def _main() -> int:
         elif args.command == "summary":
             generate_summary = get_command_function("generate_summary")
             return generate_summary(output_file=args.output_file, verbose=verbose, debug=debug)
+        elif args.command == "install":
+            install_package = get_command_function("install_package")
+            return install_package(
+                target=args.install_target,
+                package=args.package,
+                sha256=args.sha256,
+                assume_yes=args.yes,
+                allow_reboot=args.allow_reboot,
+                verbose=verbose or debug,
+            )
+        elif args.command == "uninstall":
+            uninstall_package = get_command_function("uninstall_package")
+            return uninstall_package(
+                target=args.uninstall_target,
+                assume_yes=args.yes,
+                keep_data=args.keep_data,
+                verbose=verbose or debug,
+            )
         elif args.command == "deps":
             if args.list:
                 list_dependencies = get_command_function("list_dependencies")

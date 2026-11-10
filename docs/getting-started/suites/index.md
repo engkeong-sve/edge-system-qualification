@@ -34,6 +34,7 @@ Intel® ESQ provides a comprehensive collection of test suites to assess and qua
         - [Video Analytics](#video-analytics)
     - [Real-Time Performance](#real-time-performance)
     - [Real-Time Platform](#real-time-platform)
+    - [Real-Time PROe](#real-time-proe)
     - [System CPU](#system-cpu)
     - [System Display](#system-display)
     - [System GPU](#system-gpu)
@@ -623,6 +624,21 @@ esq run --profile profile.suite.realtime.performance
 ```bash
 esq run --profile profile.suite.realtime.platform
 ```
+
+---
+
+### Real-Time PROe
+
+**Profiles** (need the optional PROe backend):
+`profile.suite.realtime.proe_1ms_ai_single_dut`, `profile.suite.realtime.proe_1ms_ai_single_dut_baseline`, `profile.suite.realtime.proe_control`
+
+| Test ID | Test Case |
+|---------|-----------|
+| RT-PROE-001 | PROe 1 ms AI benchmark (single DUT, 2 NICs) |
+| RT-PROE-002 | PROe control benchmark |
+| RT-PROE-003 | PROe 1 ms AI benchmark (single DUT, 2 NICs, baseline without host tuning) |
+
+See the [PROe guide](proe.md) for installation, configuration, metrics, and troubleshooting.
 
 ---
 
