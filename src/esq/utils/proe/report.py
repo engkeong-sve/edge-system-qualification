@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from esq.utils.proe.constants import REPORT_CONTRACTS, ReportError
+from esq.utils.proe.constants import PROE_EXIT_KPI_FAILED, REPORT_CONTRACTS, ReportError
 
 _STATUS_VALUES = ("PASS", "FAIL")
 _PTP_VALUES = ("LOCKED", "UNLOCKED")
@@ -154,6 +154,8 @@ def check_run_consistency(report: ParsedReport, exit_code: int) -> Optional[str]
     """Return a problem text when the CLI exit code and the report disagree, else ``None``."""
     if exit_code == 0 and report.pipeline_status != "PASS":
         return f"PROe exited successfully but the report status is {report.pipeline_status}."
+    if exit_code == PROE_EXIT_KPI_FAILED and report.pipeline_status != "FAIL":
+        return f"PROe exited with code {exit_code} (KPI failed) but the report status is {report.pipeline_status}."
     return None
 
 
@@ -192,6 +194,9 @@ def _integer(parent: Dict[str, Any], key: str, where: str, minimum: int = 0) -> 
     if key not in parent:
         raise ReportError(f"Report is missing '{key}' in {where}.")
     value = parent[key]
+    # PROe writes counts as JSON numbers such as 20.0; a whole number is accepted, a fraction is not.
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        value = int(value)
     if isinstance(value, bool) or not isinstance(value, int):
         raise ReportError(f"Report field '{where}.{key}' must be an integer, got {value!r}.")
     if value < minimum:

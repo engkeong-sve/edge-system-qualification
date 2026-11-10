@@ -1,0 +1,34 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+name: "profile.suite.realtime.proe_1ms_ai_single_dut_baseline"
+description: "PROe 1 ms AI real-time benchmark on a single DUT with two NICs, no host tuning (baseline for comparison)"
+version: "1.0.0"
+# Needs the optional PROe backend: 'esq install proe'. The run stops with that hint when PROe is not installed.
+params:
+  labels:
+    profile_display_name: "Real-Time PROe 1 ms AI (Single DUT, 2 NICs, Baseline)"
+    group: "realtime.proe"
+    type: "suite"
+    display_status: false
+  requirements:
+    os_type:
+      - "linux"
+
+suites:
+  - name: "realtime"
+    sub_suites:
+      - name: "proe"
+        tests:
+          test_proe:
+            params:
+              - test_id: "RT-PROE-003"
+                display_name: "PROe 1 ms AI Benchmark (Single DUT, 2 NICs, Baseline)"
+                description: |
+                  Runs the PROe 1 ms AI benchmark on a single DUT with two NICs cabled to each other, exactly as the
+                  PROe package ships it: the vendor TCC sample and no OS tuning. Use it as the reference to compare
+                  with profile.suite.realtime.proe_1ms_ai_single_dut, which applies the host tuning.
+                  The test reports the measured latency, jitter, packet loss and clock synchronization values.
+                  Execution success is not qualification: no pass/fail threshold is applied.
+                esq_profile: "profile.suite.realtime.proe_1ms_ai_single_dut_baseline"
+                timeout: 3600  # seconds allowed for the PROe run

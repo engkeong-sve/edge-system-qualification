@@ -12,7 +12,9 @@ before the run started and whose profile and timestamp match the run is accepted
 A run is an error, not a result, when the PROe service is not active, the run times out (one hour by default),
 no new report or more than one new report appears, the report is older than the run or belongs to another
 profile, a field is missing, null, not finite or has an unexpected unit, type or status value, or the exit code
-and the report status contradict each other. The command, its output and the raw report are attached to the
+and the report status contradict each other. PROe exits with code 3 when the run completed and a KPI failed; it
+still writes a report with status FAIL, and that report is read like any other so its metrics appear in the
+ESQ report. Any other non-zero exit code is an error. The command, its output and the raw report are attached to the
 ESQ report as evidence. Network and clock settings belong to the PROe profile of the installed package, not to
 ESQ.
 
@@ -27,6 +29,7 @@ extra arguments is never accepted, so this adapter is never reached for it.
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -35,14 +38,23 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from esq.utils.proe.availability import resolve_profile
-from esq.utils.proe.constants import VENDOR_SERVICE_NAME, ProeError, ReportError
+from esq.utils.proe.constants import PROE_EXIT_KPI_FAILED, VENDOR_SERVICE_NAME, ProeError, ReportError
 from esq.utils.proe.report import ParsedReport, check_run_consistency, parse_report_text
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT_S = 3600
+OS_TUNING_TIMEOUT_S = 300
 REPORT_GLOB = "benchmark_*.json"
 MAX_REPORT_BYTES = 8 * 1024 * 1024
+
+# A KPI row of the PROe console summary, for example "  RX Workload Outliers: 20  (threshold: 0)  FAIL".
+_KPI_FAIL_RE = re.compile(
+    r"^[ \t]*(?P<name>[A-Za-z][^:\n]*?):[ \t]*(?P<value>\S+)[ \t]+"
+    r"\(threshold:[ \t]*(?P<limit>[^)\n]*?)\)[ \t]+FAIL[ \t]*$",
+    re.MULTILINE,
+)
+_TUNING_SCRIPT_RE = re.compile(r"^/(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+\.sh$")
 
 
 @dataclass(frozen=True)
@@ -185,7 +197,7 @@ def run_benchmark(
     evidence = {"command": " ".join(argv), "stdout": outcome.stdout, "stderr": outcome.stderr}
     if outcome.timed_out:
         raise RunFailure(f"The PROe benchmark did not finish within {timeout_s} seconds.", evidence)
-    if outcome.returncode != 0:
+    if outcome.returncode not in (0, PROE_EXIT_KPI_FAILED):
         raise RunFailure(
             f"PROe exited with code {outcome.returncode}"
             + (" (sudo needs credentials: run 'sudo -v' first)." if "password" in outcome.stderr.lower() else "."),
@@ -198,6 +210,10 @@ def run_benchmark(
         evidence["report"] = text
         report = parse_report_text(text, profile.proe_profile, profile.report_schema)
     except ReportError as exc:
+        if outcome.returncode != 0:
+            raise RunFailure(
+                f"PROe exited with code {outcome.returncode} and left no usable report: {exc}", evidence
+            ) from exc
         raise RunFailure(str(exc), evidence) from exc
 
     if report.timestamp < start_floor:
@@ -225,3 +241,38 @@ def run_benchmark(
 def report_as_json(run: BenchmarkRun) -> str:
     """Pretty-printed raw report for attaching as evidence."""
     return json.dumps(json.loads(run.report_text), indent=2, sort_keys=True)
+
+
+def failed_kpi_lines(stdout: str) -> List[str]:
+    """KPI rows that PROe printed as FAIL, for example ``RX Workload Outliers: 20 (limit 0)``."""
+    return [f"{m['name'].strip()}: {m['value']} (limit {m['limit'].strip()})" for m in _KPI_FAIL_RE.finditer(stdout)]
+
+
+def run_os_tuning(
+    script: str,
+    *,
+    executor: Executor = subprocess_executor,
+    is_root: Optional[bool] = None,
+    exists: Callable[[str], bool] = os.path.isfile,
+) -> str:
+    """Run the host tuning script that the installed PROe package provides and return its output.
+
+    Raises:
+        RunFailure: When the script path is not acceptable, the script is not installed, or it fails.
+    """
+    if not isinstance(script, str) or not _TUNING_SCRIPT_RE.match(script) or ".." in script.split("/"):
+        raise RunFailure(f"The OS tuning script path is not acceptable: {script!r}.")
+    if not exists(script):
+        raise RunFailure(f"The OS tuning script {script} is not installed; install a PROe package that provides it.")
+    root = is_root if is_root is not None else (hasattr(os, "geteuid") and os.geteuid() == 0)
+    argv = ["bash", script] if root else ["sudo", "-n", "--", "bash", script]
+    logger.info("Running OS tuning: " + " ".join(argv))
+    outcome = executor(argv, OS_TUNING_TIMEOUT_S)
+    output = " ".join(argv) + "\n" + outcome.stdout + outcome.stderr
+    if outcome.timed_out:
+        raise RunFailure(
+            f"The OS tuning script did not finish within {OS_TUNING_TIMEOUT_S} seconds.", {"os-tuning": output}
+        )
+    if outcome.returncode != 0:
+        raise RunFailure(f"The OS tuning script failed (exit code {outcome.returncode}).", {"os-tuning": output})
+    return output

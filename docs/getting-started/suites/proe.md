@@ -55,6 +55,7 @@ The profile runs the PROe `1ms_ai_single_dut` profile: the reference and mirror 
 ```bash
 ip -br link                                              # find the two cabled NICs
 sudo nano /etc/proe/profile_configs/1ms_ai_single_dut.yaml
+sudo nano /etc/proe/profile_configs/1ms_ai_single_dut_baseline.yaml
 ```
 
 | Setting | Set it to |
@@ -73,6 +74,10 @@ Prime `sudo` credentials first, because the run never prompts for a password:
 sudo -v
 esq run --profile profile.suite.realtime.proe_1ms_ai_single_dut
 ```
+
+The profile `profile.suite.realtime.proe_1ms_ai_single_dut` applies the host tuning that the PROe package provides (an OS tuning script, run before the benchmark, and a host tuning file in the PROe profile). The profile `profile.suite.realtime.proe_1ms_ai_single_dut_baseline` applies neither, to compare against it. Run the baseline first after a reboot: the tuning stays in effect until the next reboot.
+
+When PROe reports a failed KPI, the test fails, and the metrics of that run and the failed KPI rows are still shown in the report.
 
 You can also select the profile in the interactive `esq run` prompt.
 
@@ -99,6 +104,6 @@ ESQ reads each metric from the report schema version that the package declares.
 | Host not compatible | Use the package built for your Ubuntu release and architecture. |
 | Existing files block installation | Run the `uninstall.sh` script of the package that installed them, as root, then retry. |
 | `The PROe backend is not installed` | Run `esq install proe` first. |
-| The run fails while configuring a NIC | Set the two NIC names in `/etc/proe/profile_configs/1ms_ai_single_dut.yaml` to the two cabled NICs of this machine. |
+| The run fails while configuring a NIC | Set the two NIC names in `/etc/proe/profile_configs/1ms_ai_single_dut.yaml` and `1ms_ai_single_dut_baseline.yaml` to the two cabled NICs of this machine. |
 | `A previous 'esq uninstall proe' has not finished` | Run `esq uninstall proe` again. Do not reboot again. |
 | `sudo` credentials required | Run `sudo -v`, then run again. |

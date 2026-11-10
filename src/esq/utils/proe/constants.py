@@ -70,6 +70,10 @@ INSTALL_STATE_SCHEMA = "esq-proe-install-state/1"
 # with the reference and mirror roles on the same machine. The name is the one PROe uses for it.
 TOPOLOGY_SINGLE_DUT_DUAL_NIC = "single-dut-dual-nic"
 
+# Exit code of ``proe profile run-benchmark`` when the run completed and at least one KPI failed. PROe still writes
+# a report with status FAIL in that case.
+PROE_EXIT_KPI_FAILED = 3
+
 
 @dataclass(frozen=True)
 class KnownProfile:
@@ -85,6 +89,9 @@ class KnownProfile:
 KNOWN_PROFILES: dict[str, KnownProfile] = {
     "profile.suite.realtime.proe_1ms_ai_single_dut": KnownProfile(
         "profile.suite.realtime.proe_1ms_ai_single_dut", "RT-PROE-001"
+    ),
+    "profile.suite.realtime.proe_1ms_ai_single_dut_baseline": KnownProfile(
+        "profile.suite.realtime.proe_1ms_ai_single_dut_baseline", "RT-PROE-003"
     ),
     "profile.suite.realtime.proe_control": KnownProfile("profile.suite.realtime.proe_control", "RT-PROE-002"),
 }

@@ -10,7 +10,11 @@ is executed fresh: results are never read from or written to the ESQ result cach
 report produced by this exact run is accepted.
 
 A completed run is *execution success*, not qualification. ESQ applies no thresholds to these
-metrics; the PROe pipeline status is surfaced as information only.
+metrics; the PROe pipeline status is surfaced as information only. When PROe reports status FAIL (exit code 3),
+the metrics of its report are still recorded and the test fails with the KPI rows that PROe printed as FAIL.
+
+A profile may name an ``os_tuning_script`` that the installed PROe package provides. ESQ runs it, and attaches its
+output, before every benchmark of that profile; the benchmark is not started when the script is missing or fails.
 """
 
 import logging
@@ -19,7 +23,15 @@ import allure
 import pytest
 from sysagent.utils.core import Metrics, Result
 
-from esq.utils.proe.adapter import DEFAULT_TIMEOUT_S, BenchmarkRun, RunFailure, report_as_json, run_benchmark
+from esq.utils.proe.adapter import (
+    DEFAULT_TIMEOUT_S,
+    BenchmarkRun,
+    RunFailure,
+    failed_kpi_lines,
+    report_as_json,
+    run_benchmark,
+    run_os_tuning,
+)
 from esq.utils.proe.constants import KNOWN_PROFILES, ProeError
 
 logger = logging.getLogger(__name__)
@@ -39,7 +51,8 @@ def _result_from_run(test_id: str, display_name: str, run: BenchmarkRun) -> Resu
         name=f"{test_id} - {display_name}",
         metadata={"status": run.report.pipeline_status == "PASS"},
         extended_metadata={
-            "message": f"PROe run completed; PROe pipeline status {run.report.pipeline_status}",
+            "message": f"PROe run completed; PROe pipeline status {run.report.pipeline_status}"
+            + "".join(f"; {kpi}" for kpi in failed_kpi_lines(run.stdout)),
             "qualification": "not assessed: ESQ applies no approved thresholds to PROe metrics",
             "ptp_sync_status": run.report.ptp_sync_status,
             "report_schema_version": run.report.schema_version,
@@ -85,8 +98,12 @@ def test_proe(
     failure_message = ""
     evidence = {}
     run = None
+    os_tuning_script = configs.get("os_tuning_script")
     with allure.step("Execute PROe benchmark (fresh run, result cache bypassed)"):
         try:
+            if os_tuning_script:
+                with allure.step("Apply host OS tuning"):
+                    _attach_text(run_os_tuning(os_tuning_script), "proe-os-tuning.txt")
             run = run_benchmark(esq_profile, timeout_s=timeout_s)
         except RunFailure as error:
             failure_message = str(error)
@@ -100,7 +117,10 @@ def test_proe(
         allure.attach(report_as_json(run), name=run.report_path.name, attachment_type=allure.attachment_type.JSON)
         result = _result_from_run(test_id, display_name, run)
         if not result.metadata["status"]:
-            failure_message = f"PROe reported pipeline status {run.report.pipeline_status}"
+            kpis = failed_kpi_lines(run.stdout)
+            failure_message = f"PROe reported pipeline status {run.report.pipeline_status}" + (
+                f": {'; '.join(kpis)}" if kpis else ""
+            )
     else:
         for key, value in evidence.items():
             _attach_text(value, f"proe-{key}.txt")

@@ -28,7 +28,10 @@ suites:
                   Runs the PROe 1 ms AI benchmark with the reference and mirror roles on this one system, each on its
                   own NIC, with the two NICs cabled to each other (PROe topology single-dut-dual-nic). The NIC names
                   come from the PROe profile that the installed package provides.
+                  Before the run, ESQ applies the host OS tuning script that the package installs, and the PROe profile
+                  applies the package's host (TCC) tuning. Compare with the _baseline profile, which applies neither.
                   The test reports the measured latency, jitter, packet loss and clock synchronization values.
                   Execution success is not qualification: no pass/fail threshold is applied.
                 esq_profile: "profile.suite.realtime.proe_1ms_ai_single_dut"
+                os_tuning_script: "/opt/proe/proe-os-tuning.sh"  # provided by the PROe package, run before the benchmark
                 timeout: 3600  # seconds allowed for the PROe run

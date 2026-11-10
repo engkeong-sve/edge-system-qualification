@@ -170,6 +170,23 @@ class ReportParsingTests(unittest.TestCase):
                 )
             )
 
+    def test_whole_number_floats_are_accepted_as_counts(self):
+        parsed = self.parse(
+            report(
+                results__rt_performance__rtt={"latency": {"mean": 1, "jitter": 1, "unit": "us"}, "outliers": 20.0}
+            )
+        )
+        self.assertEqual({m.name: m.value for m in parsed.metrics}["rtt_outliers"], 20)
+        with self.assertRaisesRegex(ReportError, "integer"):
+            self.parse(
+                report(
+                    results__rt_performance__rtt={
+                        "latency": {"mean": 1, "jitter": 1, "unit": "us"},
+                        "outliers": float("inf"),
+                    }
+                )
+            )
+
     def test_bad_ptp_status(self):
         with self.assertRaisesRegex(ReportError, "ptp_sync_status"):
             self.parse(report(results__clock_sync={"offset": {"mean": 1, "unit": "ns"}, "ptp_sync_status": "Not set", "sample_count": 1}))
@@ -178,6 +195,10 @@ class ReportParsingTests(unittest.TestCase):
         parsed = self.parse(report(status="FAIL"))
         self.assertIn("FAIL", check_run_consistency(parsed, 0))
         self.assertIsNone(check_run_consistency(self.parse(GOOD_REPORT), 0))
+
+    def test_kpi_failed_exit_code_needs_a_failed_report(self):
+        self.assertIsNone(check_run_consistency(self.parse(report(status="FAIL")), 3))
+        self.assertIn("report status is PASS", check_run_consistency(self.parse(GOOD_REPORT), 3))
 
 
 class FakeExecutor:
@@ -293,6 +314,41 @@ class AdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(adapter.RunFailure, "expected"):
             self._run(executor)
 
+    def test_kpi_failed_exit_with_failed_report_is_a_result(self):
+        executor = FakeExecutor(self.results, writes=[("benchmark_x.json", report(status="FAIL"))], returncode=3)
+        run = self._run(executor)
+        self.assertEqual(run.exit_code, 3)
+        self.assertEqual(run.report.pipeline_status, "FAIL")
+        self.assertTrue(run.report.metrics)
+
+    def test_kpi_failed_exit_with_passing_report_is_inconsistent(self):
+        executor = FakeExecutor(self.results, returncode=3)
+        with self.assertRaisesRegex(adapter.RunFailure, "report status is PASS"):
+            self._run(executor)
+
+    def test_kpi_failed_exit_without_report_names_the_exit_code(self):
+        executor = FakeExecutor(self.results, writes=[], returncode=3)
+        with self.assertRaisesRegex(adapter.RunFailure, "exited with code 3 and left no usable report"):
+            self._run(executor)
+
+    def test_other_nonzero_exit_ignores_a_report(self):
+        executor = FakeExecutor(self.results, writes=[("benchmark_x.json", report(status="FAIL"))], returncode=1)
+        with self.assertRaisesRegex(adapter.RunFailure, "exited with code 1"):
+            self._run(executor)
+
+    def test_failed_kpi_rows_are_read_from_stdout(self):
+        stdout = (
+            "Key Performance Indicators:\n"
+            "  RTT Outliers: 0  (threshold: 0)  PASS\n"
+            "  Processing First Outliers: 2  (threshold: 0)  FAIL\n"
+            "  RX Workload Outliers: 20  (threshold: 0)  FAIL\n"
+        )
+        self.assertEqual(
+            adapter.failed_kpi_lines(stdout),
+            ["Processing First Outliers: 2 (limit 0)", "RX Workload Outliers: 20 (limit 0)"],
+        )
+        self.assertEqual(adapter.failed_kpi_lines("all good"), [])
+
     def test_inactive_service_is_reported_before_running(self):
         executor = FakeExecutor(self.results, service="inactive")
         with self.assertRaisesRegex(ProeError, "not active"):
@@ -315,6 +371,59 @@ class AdapterTests(unittest.TestCase):
         first = self._run(FakeExecutor(self.results))
         second = self._run(FakeExecutor(self.results, writes=[("benchmark_1ms_ai_20260102T030406Z.json", GOOD_REPORT)]))
         self.assertNotEqual(first.report_path, second.report_path)
+
+
+class OsTuningTests(unittest.TestCase):
+    SCRIPT = "/opt/proe/proe-os-tuning.sh"
+
+    def _executor(self, returncode=0, timed_out=False):
+        calls = []
+
+        def run(argv, timeout):
+            calls.append((list(argv), timeout))
+            return adapter.CommandOutput(returncode, "tuned\n", "warn\n", timed_out)
+
+        run.calls = calls
+        return run
+
+    def test_runs_the_script_as_root(self):
+        executor = self._executor()
+        output = adapter.run_os_tuning(self.SCRIPT, executor=executor, is_root=True, exists=lambda _p: True)
+        self.assertEqual(executor.calls[0][0], ["bash", self.SCRIPT])
+        self.assertEqual(executor.calls[0][1], adapter.OS_TUNING_TIMEOUT_S)
+        self.assertIn("tuned", output)
+
+    def test_uses_non_interactive_sudo_when_not_root(self):
+        executor = self._executor()
+        adapter.run_os_tuning(self.SCRIPT, executor=executor, is_root=False, exists=lambda _p: True)
+        self.assertEqual(executor.calls[0][0], ["sudo", "-n", "--", "bash", self.SCRIPT])
+
+    def test_missing_script_stops_before_running(self):
+        executor = self._executor()
+        with self.assertRaisesRegex(adapter.RunFailure, "not installed"):
+            adapter.run_os_tuning(self.SCRIPT, executor=executor, is_root=True, exists=lambda _p: False)
+        self.assertEqual(executor.calls, [])
+
+    def test_unacceptable_paths_are_refused(self):
+        executor = self._executor()
+        for bad in ("relative.sh", "/opt/proe/../etc/x.sh", "/opt/proe/x.py", "/opt/proe/a b.sh", "", None):
+            with self.assertRaisesRegex(adapter.RunFailure, "not acceptable"):
+                adapter.run_os_tuning(bad, executor=executor, is_root=True, exists=lambda _p: True)
+        self.assertEqual(executor.calls, [])
+
+    def test_failing_script_carries_its_output(self):
+        with self.assertRaises(adapter.RunFailure) as ctx:
+            adapter.run_os_tuning(
+                self.SCRIPT, executor=self._executor(returncode=1), is_root=True, exists=lambda _p: True
+            )
+        self.assertIn("exit code 1", str(ctx.exception))
+        self.assertIn("tuned", ctx.exception.evidence["os-tuning"])
+
+    def test_script_timeout(self):
+        with self.assertRaisesRegex(adapter.RunFailure, "did not finish within"):
+            adapter.run_os_tuning(
+                self.SCRIPT, executor=self._executor(returncode=-1, timed_out=True), is_root=True, exists=lambda _p: True
+            )
 
 
 if __name__ == "__main__":
